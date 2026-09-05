@@ -1,0 +1,12 @@
+# 核心依赖（刻意保持轻量：不依赖 torch / ultralytics）
+# YOLO 通过 OpenCV DNN + ONNX 运行，模型文件仅 ~12MB
+#
+# streamlit 下限 1.37：后台任务面板依赖 st.fragment 自动局部刷新；
+# 上限锁 <2.0：界面大量使用 use_container_width，2.0 会移除该参数。
+streamlit>=1.37,<2.0
+numpy>=1.24
+opencv-python-headless>=4.9
+Pillow>=10.0
+pandas>=2.0
+
+# 可选：需要 GPU 硬解加速时确保 ffmpeg 编译时带 cuvid 支持
