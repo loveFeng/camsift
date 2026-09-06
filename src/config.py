@@ -111,6 +111,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sample_seconds": 0,           # 0=抽全量音轨；>0 只抽前 N 秒（快速初筛）
         "vad_speech_threshold": 0.3,   # 语音占总时长比例低于此值 → "基本无人声"
         "min_speech_sec": 1.0,         # 单段人声短于该秒数视为噪音段，不转写
+        "vad_speech_noise_thres": 0.6, # fsmn-vad 语音/噪声判别阈值（越高越宽容，越大越容易把噪声判成语音）
+        "min_transcript_chars": 4,     # VAD 漏检时 ASR 兜底：转写有效字数≥该值判定有语音
         "punc_model": True,            # 是否启用标点模型 ct-punc（让人好读）
         "max_segments": 40,            # 单片段最多转写段数，超长截断（控制成本）
         "cleanup_wav": False,          # 复核落库后是否清理抽出的 wav（要播放则保留）

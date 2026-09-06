@@ -38,6 +38,14 @@ CHANNELS = 1                 # 单声道
 MAX_EXTRACT_SEC = 600        # 单段音频抽取上限（防异常超长文件拖死任务）
 FFMPEG_TIMEOUT = 180
 
+
+def _effective_chars(text: str) -> int:
+    """转写文本的有效字数：去掉空白与中英文标点后的字符数（判定转写是否实质有内容）。"""
+    if not text:
+        return 0
+    drop = set(" \t\r\n，。！？；：、\u201c\u201d\u2018\u2019\"'!?,.;:-—…()（）[]【】《》<>")
+    return sum(1 for ch in text if ch not in drop)
+
 JUDGE_SYSTEM = (
     "你是监控录像复核助手。下面是一段【已被 AI 判定画面中无人无车】的监控视频里"
     "录到的声音转写（可能含噪声音量、识别错字）。\n"
@@ -221,7 +229,8 @@ class AudioReviewer:
 
         # 1) VAD 人声分段。funasr 输出形如 [{'key':…, 'value': [[s_ms,e_ms],…]}] 或
         #    [{'value': …}]；低版本也可能直接是 [[s,e],…]。宽容解析。
-        raw = vad.generate(input=str(wav))
+        raw = vad.generate(input=str(wav),
+                           speech_noise_thres=float(self.a.get("vad_speech_noise_thres", 0.6)))
         segs_ms: List[List[int]] = []
         for item in raw if isinstance(raw, (list, tuple)) else [raw]:
             v = item.get("value") if isinstance(item, dict) else None
@@ -240,8 +249,12 @@ class AudioReviewer:
         ratio = min(1.0, speech_sec / dur) if dur > 0 else 0.0
 
         # 2) 有语音段才跑 ASR（省算力，避免对纯噪声做无谓转写）
+        #    VAD 兜底：fsmn-vad 对部分 DVR 低保真音频（8kHz 采样+底噪）会整段漏检
+        #    （实测 2015 年监控视频"明明有人说话"VAD 返回空）。此时强制整段 ASR，
+        #    转写出有效文字则视为有语音——宁可多转写一次，不可漏检真说话。
+        vad_missed = not segs_ms
         text = ""
-        if segs_ms:
+        if segs_ms or vad_missed:
             raw_asr = asr.generate(input=str(wav))
             texts = []
             for item in raw_asr if isinstance(raw_asr, (list, tuple)) else [raw_asr]:
@@ -256,6 +269,16 @@ class AudioReviewer:
         if speech_present and not text.strip():
             if ratio < float(self.a.get("vad_speech_threshold", 0.3)):
                 speech_present = 0
+        # VAD 漏检但 ASR 转写出有效文字 → 判有语音（兜底）
+        if vad_missed and speech_present == 0:
+            min_chars = int(self.a.get("min_transcript_chars", 4))
+            if _effective_chars(text) >= min_chars:
+                speech_present = 1
+                # VAD 无法分段，用字数估算语音时长下限（中文约 4 字/秒），
+                # 占比保守取估算值，UI 不再显示"约 0%"
+                est_sec = _effective_chars(text) / 4.0
+                ratio = min(1.0, est_sec / dur) if dur > 0 else 0.0
+                segs_ms = [[0, int(dur * 1000)]]   # 全段占位，便于查看转写上下文
         return {
             "speech_present": speech_present,
             "speech_ratio": round(ratio, 4),

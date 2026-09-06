@@ -673,6 +673,46 @@ def test_audio_review():
     check(all(fmt_eta(s) == w for s, w in _eta_cases),
           f"fmt_eta 完整时长格式（{len(_eta_cases)} 档位全对，无省略）")
 
+    # 10) VAD 漏检兜底（真实案例：2015 DVR 8kHz 音频有人说话，fsmn-vad 返回空段 → 0%）
+    #     规则：VAD 空段时强制整段 ASR，有效字数 ≥ min_transcript_chars → 判有语音
+    from src.audioreview import AudioReviewer as AR2, _effective_chars
+    check(_effective_chars("你好啊啊，那里面还有一个证据。") == 13
+          and _effective_chars("嗯。啊？") == 2 and _effective_chars("") == 0
+          and _effective_chars("，。！？ ") == 0,
+          "_effective_chars：去标点空白计有效字数")
+
+    def _mk_ar(vad_segs, asr_text, **audio_extra):
+        audio = {"engine": "funasr", "min_speech_sec": 1.0,
+                 "vad_speech_threshold": 0.3, "min_transcript_chars": 4}
+        audio.update(audio_extra)
+        ar = AR2({"audio": audio, "llm": {"enabled": False}, "runtime": {}, "work_dir": "."})
+        class _V:   # 模拟 fsmn-vad
+            @staticmethod
+            def generate(input, **kw):
+                return [{"key": "k", "value": [list(s) for s in vad_segs]}]
+        class _A:   # 模拟 paraformer
+            @staticmethod
+            def generate(input, **kw):
+                return [{"key": "k", "text": asr_text}]
+        ar._load_engine = lambda: (_V, _A, None)   # 覆盖真实引擎加载
+        return ar
+
+    wav = Path("unused.wav")   # mock 引擎不读文件
+    r = _mk_ar([], "你好啊啊，那里面还有一个证据。").review_wav(wav, 43.5)
+    check(r["speech_present"] == 1 and r["speech_ratio"] > 0
+          and r["speech_segments"] == "[[0.0, 43.5]]",
+          f"VAD 漏检兜底：ASR 有字 → 判有语音（present=1, ratio={r['speech_ratio']}）")
+    r = _mk_ar([], "").review_wav(wav, 43.5)
+    check(r["speech_present"] == 0 and r["speech_ratio"] == 0.0,
+          "VAD 漏检兜底：ASR 也无字 → 维持无人声")
+    r = _mk_ar([], "嗯，啊。").review_wav(wav, 43.5)   # 有效字数 2 < 4
+    check(r["speech_present"] == 0 and r["speech_ratio"] == 0.0,
+          "VAD 漏检兜底：ASR 仅语气词（低于 min_transcript_chars）→ 无人声")
+    r = _mk_ar([[1000, 9000]], "测试转写内容").review_wav(wav, 43.5)
+    check(r["speech_present"] == 1 and abs(r["speech_ratio"] - 8.0 / 43.5) < 0.01
+          and r["speech_segments"] == "[[1.0, 9.0]]",
+          "VAD 正常检出路径不受兜底影响（按段计时长）")
+
 
 def main() -> int:
     cfg = load_config()
