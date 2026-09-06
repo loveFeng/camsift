@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS videos (
     vlm_reviewed_at  TEXT,
     final_score      REAL,
 
+    -- L2.5 音频复核（有声事件捞回，见开发计划 3.6）
+    audio_checked      INTEGER,   -- 0 未复核 / 1 已复核 / -1 无音轨跳过
+    speech_present     INTEGER,   -- VAD 是否检出人声（0/1）
+    speech_ratio       REAL,      -- 语音时长占比
+    speech_segments    TEXT,      -- VAD 分段 JSON（起止时间戳）
+    transcript_text    TEXT,      -- 转写全文（给人看）
+    transcript_segments TEXT,     -- 段级时间戳 JSON
+    llm_useful         INTEGER,   -- 1 有用 / 0 无用 / 2 不确定
+    llm_reason         TEXT,      -- LLM 结论理由
+    audio_error        TEXT,      -- 复核失败原因（技术失败默认保留）
+    audio_checked_at   TEXT,
+
     -- 人工处置
     human_decision   TEXT,
     human_at         TEXT,
@@ -130,6 +142,21 @@ STATUS_KEEP = "keep"
 STATUS_TRASH = "trash"
 STATUS_ERROR = "error"
 
+# L2.5 音频复核列。老库在 init_db 时用 PRAGMA 检查后 ALTER TABLE 补齐
+# （SQLite 的 ALTER TABLE 不支持 ADD COLUMN IF NOT EXISTS，只能手动补）。
+AUDIO_COLUMNS: Dict[str, str] = {
+    "audio_checked": "INTEGER",
+    "speech_present": "INTEGER",
+    "speech_ratio": "REAL",
+    "speech_segments": "TEXT",
+    "transcript_text": "TEXT",
+    "transcript_segments": "TEXT",
+    "llm_useful": "INTEGER",
+    "llm_reason": "TEXT",
+    "audio_error": "TEXT",
+    "audio_checked_at": "TEXT",
+}
+
 
 class Database:
     def __init__(self, db_path: str | Path):
@@ -150,6 +177,14 @@ class Database:
     def init_db(self) -> None:
         with self.conn() as c:
             c.executescript(SCHEMA)
+            self._migrate(c)
+
+    def _migrate(self, c) -> None:
+        """老库补齐新增列（音频复核字段）。已存在则跳过，幂等安全。"""
+        existing = {r[1] for r in c.execute("PRAGMA table_info(videos)")}
+        for col, decl in AUDIO_COLUMNS.items():
+            if col not in existing:
+                c.execute(f"ALTER TABLE videos ADD COLUMN {col} {decl}")
 
     # ------------------------------------------------------------ 写入
     def upsert_video_meta(self, path: str, meta: Dict[str, Any]) -> int:
@@ -232,6 +267,31 @@ class Database:
                     time.strftime("%Y-%m-%d %H:%M:%S"), r.get("final_score"),
                     video_id,
                 ),
+            )
+
+    def update_audio_review(self, video_id: int, r: Dict[str, Any]) -> None:
+        """写入 L2.5 音频复核结果。r 内 None 字段不清空（只覆盖本次有值的）。"""
+        sets = []
+        args: List[Any] = []
+        for col in ("audio_checked", "speech_present", "speech_ratio",
+                    "speech_segments", "transcript_text", "transcript_segments",
+                    "llm_useful", "llm_reason", "audio_error"):
+            if col in r and r[col] is not None:
+                sets.append(f"{col}=?")
+                args.append(r[col])
+        sets.append("audio_checked_at=?")
+        args.append(time.strftime("%Y-%m-%d %H:%M:%S"))
+        args.append(video_id)
+        with self.conn() as c:
+            c.execute(f"UPDATE videos SET {', '.join(sets)} WHERE id=?", args)
+
+    def mark_audio_skipped(self, video_id: int, reason: str = "no_audio") -> None:
+        """无音轨/文件缺失等不可复核的片段：直接标记跳过，不阻塞处置。"""
+        with self.conn() as c:
+            c.execute(
+                "UPDATE videos SET audio_checked=-1, audio_error=?, audio_checked_at=? "
+                "WHERE id=?",
+                (reason, time.strftime("%Y-%m-%d %H:%M:%S"), video_id),
             )
 
     def set_human_decision(
@@ -421,6 +481,35 @@ class Database:
             args.append(batch_id)
         with self.conn() as c:
             return c.execute(sql, args).fetchone()[0]
+
+    def count_audio_pending(self, batch_id: int | None = None,
+                            only_unreviewed: bool = True) -> int:
+        """待音频复核的判删候选数（有音轨 + 未复核 + 尚未人工处置）。"""
+        sql = ("SELECT COUNT(*) FROM videos WHERE verdict IN ('trash','review') "
+               "AND meta_ok=1 AND has_audio=1")
+        args: List[Any] = []
+        if only_unreviewed:
+            sql += " AND audio_checked IS NULL AND human_decision IS NULL"
+        if batch_id:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        with self.conn() as c:
+            return c.execute(sql, args).fetchone()[0]
+
+    def audio_review_queue(self, batch_id: int | None = None, limit: int = 1000,
+                           offset: int = 0) -> List[sqlite3.Row]:
+        """音频复核队列：判删候选按分数升序（最可疑/最该删的优先复核）。"""
+        sql = ("SELECT * FROM videos WHERE verdict IN ('trash','review') "
+               "AND meta_ok=1 AND has_audio=1 AND audio_checked IS NULL "
+               "AND human_decision IS NULL")
+        args: List[Any] = []
+        if batch_id:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        sql += " ORDER BY COALESCE(final_score, retention_score, 0) ASC, id ASC LIMIT ? OFFSET ?"
+        args += [limit, int(offset or 0)]
+        with self.conn() as c:
+            return c.execute(sql, args).fetchall()
 
     def list_moved(self, batch_id: int | None = None, limit: int = 5000) -> List[sqlite3.Row]:
         """已移入回收目录、可撤销的文件。"""

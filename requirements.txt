@@ -10,3 +10,10 @@ Pillow>=10.0
 pandas>=2.0
 
 # 可选：需要 GPU 硬解加速时确保 ffmpeg 编译时带 cuvid 支持
+
+# ---- L2.5 音频复核（可选，装全后经 scripts/setup_audio_engine.py 管理）----
+# 注意：funasr 1.4.x pin numpy<2 与 Python 3.13 冲突，勿直接 pip install funasr；
+# 请运行 python scripts/setup_audio_engine.py（--no-deps + 现代依赖）。
+# GPU 加速需 CUDA 版 torch：pip install torch --index-url https://download.pytorch.org/whl/cu126
+# 模型下载：python scripts/download_audio_models.py（ModelScope 国内源 ~1.2GB）
+# LLM 有用性判断需本机 ollama + qwen3:4b：https://ollama.com 安装后 ollama pull qwen3:4b

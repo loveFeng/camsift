@@ -146,6 +146,68 @@ def render_reasons(row):
     return trace
 
 
+# --------------------------------------------------------------------------- 音频复核卡
+def _audio_wav_path(cfg: Dict, video_id: int) -> Path | None:
+    wav = Path(cfg.get("work_dir") or "") / "audio" / f"{video_id}.wav"
+    return wav if wav.exists() else None
+
+
+def render_audio_card(row, cfg: Dict):
+    """审核工作台右侧的音频复核状态卡。
+
+    回答用户的第二问：这段判删视频的声音里到底有没有内容、说了什么。
+    LLM 结论仅是参考，只展示不替代人工判断。
+    """
+    st.markdown("### 🔊 音频复核")
+    if not row["has_audio"]:
+        st.caption("该片段**无音轨** —— 没有声音内容可复核，画面判定即为最终依据。")
+        return
+    ac = row["audio_checked"]
+    if ac is None:
+        if cfg.get("audio", {}).get("enabled"):
+            st.warning("该片段**有音轨但尚未音频复核**。若画外有人声（电话/对讲/警报…），"
+                       "这段可能有用。到「设置与扫描」启动音频复核后，"
+                       "这里会展示：是否有人声 / 转写全文 / LLM 结论。")
+        else:
+            st.caption("该片段有音轨。可在「设置与扫描」启用音频复核后批量检查"
+                       "「声音里有没有说话内容」，作为清理前的二次确认。")
+        return
+    if ac == -1:
+        st.caption(f"已跳过复核：{row['audio_error'] or '无音轨'}")
+        return
+
+    sp = bool(row["speech_present"])
+    ratio = float(row["speech_ratio"] or 0.0)
+    if sp:
+        st.warning(f"**检出人声**（语音占比约 {ratio * 100:.0f}%）"
+                   " —— 可能有画外事件，请看下方转写后再决定清理与否")
+    else:
+        st.success(f"未检出有效人声（语音占比约 {ratio * 100:.0f}%）")
+
+    txt = (row["transcript_text"] or "").strip()
+    if txt:
+        with st.expander(f"📝 转写全文（{len(txt)} 字，供你确认内容）",
+                         expanded=bool(sp)):
+            st.write(txt)
+    else:
+        st.caption("转写为空 —— 无有效说话内容")
+
+    if row["llm_useful"] is not None:
+        label = {1: "🟢 可能有用", 0: "⚪ 基本无用", 2: "🟡 不确定"}.get(
+            row["llm_useful"], "•")
+        reason = row["llm_reason"] or ""
+        st.caption(f"LLM 参考：**{label}**　{reason}")
+        if sp and row["llm_useful"] == 1:
+            st.info("LLM 认为这段声音**可能有用** —— 建议保留或再人工核对一遍转写。")
+
+    wav = _audio_wav_path(cfg, row["id"])
+    if wav:
+        with st.expander("🔊 播放抽出的音频（复核中间产物）"):
+            st.audio(str(wav))
+    else:
+        st.caption("（抽出的音频已被清理或尚不存在）")
+
+
 # --------------------------------------------------------------------------- 后台任务面板
 @_fragment(run_every="1s")
 def job_panel(job, title: str, key: str):
@@ -182,6 +244,10 @@ def job_panel(job, title: str, key: str):
                 f"{icon} 扫描完成：新增 {r.get('added', 0)}，跳过 {r.get('skipped', 0)}，"
                 f"失败 {r.get('failed', 0)}，用时 {r.get('seconds', 0):.1f}s"
                 f"（批次 #{r.get('batch_id')}）")
+        elif job.kind == "audio":
+            st.success(
+                f"{icon} 音频复核完成：{r.get('checked', 0)} 段（检出人声 "
+                f"{r.get('speech', 0)} 段），失败 {r.get('errors', 0)} 段，用时 {job.elapsed:.1f}s")
         else:
             st.success(
                 f"{icon} 分析完成：成功 {r.get('analyzed', 0)}，失败 {r.get('errors', 0)}"
@@ -380,14 +446,31 @@ def tab_review(db, cfg):
     with right:
         st.markdown("### 为什么这么判定")
         render_reasons(row)
+        render_audio_card(row, cfg)
 
     st.divider()
     st.markdown("### 你的处置")
+
+    # —— 音频复核关口：有音轨且未复核的判删候选，要求人工明示后才允许一键清理 ——
+    audio_gate = (bool(row["has_audio"]) and row["audio_checked"] is None
+                  and cfg.get("audio", {}).get("enabled"))
+    confirm_skip_audio = True
+    if audio_gate:
+        st.warning("⚠️ 此片段**有音轨但尚未音频复核**。若画外有人声，它可能是你要留的"
+                   "事件记录。建议先启动音频复核查看转写，再决定。")
+        confirm_skip_audio = st.checkbox(
+            "我已人工看过原始视频，确认不需要音频复核，允许直接清理",
+            key=f"askip_{row['id']}")
+    elif row["audio_checked"] == 1 and row["speech_present"] and row["llm_useful"] == 1:
+        st.info("该片段音频复核**检出人声**且 LLM 认为可能有用 —— 若你确认这段没有保留"
+                "价值，仍可清理；此提示仅为避免误删。")
+
     note = st.text_input("备注（可选，会记入误判分析）", key=f"note_{row['id']}")
 
     a1, a2, a3 = st.columns(3)
     with a1:
-        if st.button("🗑 确认清理（移入分级回收目录）", type="primary", use_container_width=True):
+        if st.button("🗑 确认清理（移入分级回收目录）", type="primary",
+                     use_container_width=True, disabled=not confirm_skip_audio):
             if not cfg.get("trash_root"):
                 st.error("请先在「设置与扫描」配置 trash_root")
             else:
@@ -510,6 +593,20 @@ def tab_grid(db, cfg):
     st.session_state.selected = selected
 
     st.divider()
+
+    # —— 批量移入关口：所选里混有"有音轨且未复核"的判删候选时要求明示 ——
+    b_gate_ok = True
+    if selected and cfg.get("audio", {}).get("enabled"):
+        sel_rows = [db.get_video(i) for i in selected]
+        gate_rows = [r for r in sel_rows
+                     if r and r["has_audio"] and r["audio_checked"] is None]
+        if gate_rows:
+            st.warning(f"所选 **{len(selected)}** 个中有 **{len(gate_rows)} 个有音轨但尚未"
+                       "音频复核** —— 画面无人不代表没有内容，画外可能有人声事件。"
+                       "建议先跑音频复核（转写文本会在审核台展示），再回来批量移入。")
+            b_gate_ok = st.checkbox("我已人工确认这批无需音频复核，允许直接批量移入",
+                                    key="b_gate_ok")
+
     c0, c1, c2, c3 = st.columns([2, 2, 2, 2])
     c0.write(f"已选 **{len(selected)}** 个（跨页累积）")
     page_ids = [r["id"] for r in rows]
@@ -521,7 +618,7 @@ def tab_grid(db, cfg):
                   on_click=_grid_sel_clear)
     with c3:
         if st.button("🗑 批量移入回收目录", type="primary", use_container_width=True,
-                     disabled=not selected):
+                     disabled=(not selected or not b_gate_ok)):
             if not cfg.get("trash_root"):
                 st.error("请先配置 trash_root")
             else:
@@ -564,11 +661,13 @@ def tab_progress(db, cfg):
     st.subheader("执行进度")
 
     st.markdown("##### 后台任务")
-    j1, j2 = st.columns(2)
+    j1, j2, j3 = st.columns(3)
     with j1:
         job_panel(jobsmod.get_scan_job(), "🔍 扫描元数据", "scan")
     with j2:
         job_panel(jobsmod.get_analyze_job(), "🤖 AI 分析", "analyze")
+    with j3:
+        job_panel(jobsmod.get_audio_job(), "🔊 音频复核", "audio")
 
     st.divider()
     st.markdown("##### 批次进度")
@@ -734,7 +833,10 @@ def tab_settings(db, cfg):
     st.markdown("##### 执行（后台运行，不阻塞页面）")
     st.caption("任务跑在独立线程里：启动后可以随意切换页签、继续审核，进度在下方实时显示。"
                "修改阈值后请先点「保存配置」再启动，否则用的还是旧配置。")
-    limit = st.number_input("本次处理上限（建议先用小值试点）", 1, 1000000, 200, 100)
+    limit = st.number_input(
+        "本次处理上限（建议先用小值试点）", 1, 1000000,
+        int(cfg["runtime"].get("default_batch_limit", 200)),
+        100, key="limit_input")
     with_audio = st.checkbox(
         "扫描时分析音频能量（明显变慢，仅在摄像头确实录音时才有意义）",
         value=False, key="scan_audio")
@@ -746,10 +848,14 @@ def tab_settings(db, cfg):
             if not src or not Path(src).exists():
                 st.error("请先填写有效的源目录")
             else:
+                cfg["runtime"]["default_batch_limit"] = int(limit)   # 记住本次上限，重启不清空
+                save_config(cfg)
                 ok, msg = jobsmod.start_scan(db, cfg, src, int(limit), with_audio)
                 st.success(msg) if ok else st.warning(msg)
     with e2:
         if st.button("🤖 启动 AI 分析（后台）", use_container_width=True, disabled=aj.running):
+            cfg["runtime"]["default_batch_limit"] = int(limit)       # 记住本次上限
+            save_config(cfg)
             ok, msg = jobsmod.start_analyze(db, cfg, int(limit))
             if ok:
                 model = Path(cfg["analysis"].get("yolo_model_path", ""))
@@ -767,6 +873,80 @@ def tab_settings(db, cfg):
         job_panel(sj, "🔍 扫描元数据", "scan")
     with p2:
         job_panel(aj, "🤖 AI 分析", "analyze")
+
+    st.divider()
+    st.markdown("##### 🔊 音频复核（L2.5 有声事件捞回）")
+    st.caption(
+        "画面判定「无目标」的删除候选，可能画面无人但**画外有人声**（电话/对讲/询价/警报…）。"
+        "音频复核 = 抽音轨 → 人声检测 → 转写文本 → LLM 判断是否有用，把有内容的片段捞回来给你看。\n"
+        "复核结果是**参考**，最终仍由你在审核台决定；程序依然只区分与移动，不删除。")
+    ac = cfg["audio"]
+    a1, a2 = st.columns(2)
+    a_en = a1.checkbox("启用音频复核", bool(ac.get("enabled")), key="audio_en")
+    a_engine = a2.selectbox(
+        "ASR 引擎", ["funasr", "faster_whisper"],
+        index=0 if ac.get("engine", "funasr") == "funasr" else 1, key="audio_engine")
+    a3, a4 = st.columns(2)
+    a_sample = a3.number_input("抽音轨秒数（0 = 全量）", 0, 3600,
+                               int(ac.get("sample_seconds", 0)), key="audio_sample")
+    a_mdir = a4.text_input("模型目录", str(ac.get("model_dir", "")), key="audio_mdir")
+    a_dev = st.selectbox(
+        "推理设备",
+        ["auto", "cuda", "cpu"],
+        index=["auto", "cuda", "cpu"].index(str(ac.get("device", "auto"))),
+        key="audio_device",
+        help="auto=有 GPU 就用 GPU。若 GPU 被 DVR 转码等任务占满、或驱动异常导致复核"
+             "卡住（一段几分钟不动），改成 cpu 可稳定跑完（慢 3-5 倍但不会饿死）。")
+    st.markdown("**LLM 有用性判断**（需本机 ollama 已安装并拉取模型，如 qwen3:4b）")
+    l1, l2, l3 = st.columns(3)
+    l_en = l1.checkbox("启用 LLM 判断", bool(cfg["llm"].get("enabled")), key="llm_en")
+    l_model = l2.text_input("模型", str(cfg["llm"].get("model", "qwen3:4b")), key="llm_model")
+    l_ep = l3.text_input("端点", str(cfg["llm"].get("endpoint", "http://127.0.0.1:11434")),
+                         key="llm_ep")
+
+    def _apply_audio_cfg() -> None:
+        """把控件当前值写回 cfg（供保存/自检/启动共用）。"""
+        ac["enabled"] = a_en
+        ac["engine"] = a_engine
+        ac["device"] = a_dev
+        ac["sample_seconds"] = int(a_sample)
+        ac["model_dir"] = a_mdir
+        cfg["llm"]["enabled"] = l_en
+        cfg["llm"]["model"] = l_model
+        cfg["llm"]["endpoint"] = l_ep
+
+    acb1, acb2, acb3 = st.columns(3)
+    with acb1:
+        if st.button("💾 保存音频复核配置", use_container_width=True, key="save_audio"):
+            _apply_audio_cfg()
+            save_config(cfg)
+            st.success("已保存音频复核配置")
+    with acb2:
+        if st.button("🏥 引擎自检", use_container_width=True, key="check_audio"):
+            _apply_audio_cfg()
+            from src.audioreview import AudioReviewer
+            problems = AudioReviewer(cfg).check_ready()
+            if problems:
+                st.warning("待处理：\n" + "\n".join(f"· {p}" for p in problems))
+            else:
+                st.success("引擎就绪：ASR 依赖与模型在位 ✓（LLM 判断按开关是否启用）")
+    with acb3:
+        if st.button("▶ 启动音频复核（后台）", use_container_width=True, key="start_audio",
+                     disabled=jobsmod.get_audio_job().running):
+            _apply_audio_cfg()
+            cfg["runtime"]["default_batch_limit"] = int(limit)   # 记住本次上限
+            save_config(cfg)
+            from src.audioreview import AudioReviewer
+            problems = AudioReviewer(cfg).check_ready()
+            if problems:
+                st.warning("引擎未就绪，未启动：\n" + "\n".join(f"· {p}" for p in problems))
+            else:
+                ok, msg = jobsmod.start_audio_review(db, cfg, int(limit))
+                st.success(msg) if ok else st.warning(msg)
+
+    n_pending_audio = db.count_audio_pending()
+    st.caption(f"当前待复核判删候选：**{n_pending_audio}** 段（有音轨、未复核、未处置）"
+               " —— 启动后任务自动跳过已复核/无音轨片段，可随时停止，进度写入数据库不丢。")
 
     st.divider()
     st.markdown("##### 导出清单")

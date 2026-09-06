@@ -23,8 +23,9 @@ from typing import Any, Callable, Deque, Dict, Optional
 
 _SCAN = "scan"
 _ANALYZE = "analyze"
+_AUDIO = "audio"
 
-KIND_NAMES = {_SCAN: "扫描元数据", _ANALYZE: "AI 分析"}
+KIND_NAMES = {_SCAN: "扫描元数据", _ANALYZE: "AI 分析", _AUDIO: "音频复核"}
 
 
 class Job:
@@ -178,6 +179,26 @@ def _run_analyze(job: Job, db, cfg: Dict, limit: Optional[int]) -> None:
     job.processed = res.get("analyzed", 0) + res.get("errors", 0)
 
 
+def _run_audio(job: Job, db, cfg: Dict, limit: Optional[int],
+               batch_id: Optional[int]) -> None:
+    """音频复核：对判删候选（有音轨、未复核）做 VAD+ASR+LLM。"""
+    from .audioreview import AudioReviewer, AudioEngineError
+    ar = AudioReviewer(cfg)
+    problems = ar.check_ready()
+    if problems:
+        raise AudioEngineError("引擎未就绪：" + "；".join(problems))
+    pending = db.count_audio_pending(batch_id)
+    if limit:
+        pending = min(pending, limit)
+    job.total = pending
+    res = ar.run_batch(
+        db, limit=limit, progress=_hook(job), log=job.log,
+        stop_event=job._stop, batch_id=batch_id,
+    )
+    job.result = res
+    job.processed = res.get("checked", 0) + res.get("errors", 0)
+
+
 def _count_pending(db) -> int:
     with db.conn() as c:
         r = c.execute("SELECT COUNT(*) FROM videos WHERE status IN ('metadata','pending') "
@@ -194,6 +215,13 @@ def start_analyze(db, cfg, limit: Optional[int] = None) -> tuple[bool, str]:
     return MANAGER.start(_ANALYZE, lambda j: _run_analyze(j, db, cfg, limit))
 
 
+def start_audio_review(db, cfg, limit: Optional[int] = None,
+                       batch_id: Optional[int] = None) -> tuple[bool, str]:
+    """启动音频复核后台任务。引擎/依赖未就绪时返回错误信息。"""
+    return MANAGER.start(_AUDIO,
+                         lambda j: _run_audio(j, db, cfg, limit, batch_id))
+
+
 def get_scan_job() -> Job:
     return MANAGER.get(_SCAN)
 
@@ -202,5 +230,10 @@ def get_analyze_job() -> Job:
     return MANAGER.get(_ANALYZE)
 
 
+def get_audio_job() -> Job:
+    return MANAGER.get(_AUDIO)
+
+
 def any_running() -> bool:
-    return get_scan_job().running or get_analyze_job().running
+    return (get_scan_job().running or get_analyze_job().running
+            or get_audio_job().running)

@@ -100,6 +100,12 @@ def _mark_analyzed(db, vid: int, verdict: str = "trash", score: float = 0):
 # --------------------------------------------------------------------------- 1
 def test_misjudgment(cfg):
     section("误判归因")
+    # 测试输入必须确定：不依赖用户 config 的实际阈值（用户可能调过），
+    # 强制用默认阈值 0.5 / 记录下限 0.15，保证"conf=0.38 未达阈值"成立。
+    import copy
+    cfg = copy.deepcopy(cfg)
+    cfg.setdefault("analysis", {})["yolo_conf_threshold"] = 0.5
+    cfg["analysis"]["yolo_keep_raw_above"] = 0.15
     # 1) 未启用 YOLO
     r = fb.analyze_misjudgment(blank_row(), cfg, yolo_on=False)
     check(r["category"] == "no_yolo", f"未启用模型 → {r['category']}")
@@ -494,6 +500,136 @@ st.write(f"已选 {len(selected)} 个")
         shutil.rmtree(app_file.parent, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- 11
+def test_audio_review():
+    """音频复核层（L2.5）回归：DB 迁移/队列/复核写入/judge 解析/UI 接线。
+
+    不依赖 funasr 引擎与模型 —— 只测不碰引擎的分支与数据层逻辑，
+    引擎行为在装好依赖后用真实音频做冒烟（见 docs/开发计划 Phase 2.6）。
+    """
+    from src.audioreview import AudioReviewer
+    from src.config import DEFAULT_CONFIG
+    from src.db import AUDIO_COLUMNS
+
+    section("音频复核 L2.5：DB 迁移 / 队列 / 复核写入 / judge / UI 接线")
+
+    # 1) 默认配置含 audio/llm 段
+    check("audio" in DEFAULT_CONFIG and DEFAULT_CONFIG["audio"].get("engine") == "funasr",
+          "config 默认含 audio 段（engine=funasr）")
+    check(DEFAULT_CONFIG["audio"].get("device", "auto") in ("auto", "cuda", "cpu"),
+          "config 默认含推理设备（device=auto）")
+    check("llm" in DEFAULT_CONFIG and DEFAULT_CONFIG["llm"].get("model", "").startswith("qwen3"),
+          "config 默认含 llm 段（qwen3 模型）")
+
+    # 2) 新库字段齐全
+    d, db, bid, ids = _tmp_db(3)
+    try:
+        with db.conn() as c:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(videos)")}
+        check(all(x in cols for x in AUDIO_COLUMNS),
+              "新库 videos 表含全部音频复核列")
+
+        # 3) 队列过滤：has_audio=1 判删候选才计入待复核
+        check(db.count_audio_pending() == 0, "无有音轨候选时待复核为 0")
+        # 把 v0 改为 has_audio=1 且 verdict=trash
+        db.upsert_video_meta(str(d / "v0.mp4"), {
+            "filename": "v0.mp4", "rel_dir": "", "year": "2024",
+            "size_bytes": 1, "mtime": 0, "duration_sec": 60,
+            "width": 1920, "height": 1080, "video_codec": "hevc",
+            "has_audio": 1, "audio_energy": None, "bitrate_kbps": 1000,
+            "meta_ok": 1, "meta_error": None})
+        _mark_analyzed(db, ids[0], "trash", 0)
+        check(db.count_audio_pending() == 1, "有音轨判删候选计入待复核（1 条）")
+        q = db.audio_review_queue()
+        check(len(q) == 1 and q[0]["id"] == ids[0], "audio_review_queue 命中该候选")
+
+        # 4) 复核写入后不再进队列；跳过（无音轨/缺失）同理
+        db.update_audio_review(ids[0], {
+            "audio_checked": 1, "speech_present": 1, "speech_ratio": 0.5,
+            "speech_segments": "[]", "transcript_text": "你好，有人吗",
+            "transcript_segments": "[]", "llm_useful": 1, "llm_reason": "有人声"})
+        check(db.count_audio_pending() == 0, "复核写入后不计入待复核")
+        row = db.get_video(ids[0])
+        check(row["speech_present"] == 1 and row["llm_useful"] == 1
+              and "有人" in (row["transcript_text"] or ""),
+              "复核结果正确落库")
+
+        # 5) review_one 的引擎无关分支：无音轨 → 跳过；文件缺失 → 跳过
+        import sqlite3
+        cfg = {"work_dir": str(d), "audio": {"engine": "funasr"},
+               "llm": {"enabled": False}, "runtime": {}}
+        ar = AudioReviewer(cfg)
+        # v1 has_audio=0 且真实文件存在 → no_audio 分支（不触发引擎）
+        Path(d / "v1.mp4").write_bytes(b"x")
+        db.upsert_video_meta(str(d / "v1.mp4"), {
+            "filename": "v1.mp4", "rel_dir": "", "year": "2024",
+            "size_bytes": 1, "mtime": 0, "duration_sec": 60,
+            "width": 1920, "height": 1080, "video_codec": "hevc",
+            "has_audio": 0, "audio_energy": None, "bitrate_kbps": 1000,
+            "meta_ok": 1, "meta_error": None})
+        r = ar.review_one(db, db.get_video(ids[1]))
+        row = db.get_video(ids[1])
+        check(r.get("skipped") == "无音轨" and row["audio_checked"] == -1
+              and row["audio_error"] == "no_audio",
+              "review_one：无音轨片段跳过（audio_checked=-1）")
+        # v2 文件不存在 → missing 分支
+        r = ar.review_one(db, db.get_video(ids[2]))
+        check(r.get("skipped") == "源文件不存在",
+              "review_one：源文件缺失跳过，不进引擎")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 6) judge 解析（纯函数，5 例）
+    from src.audioreview import AudioReviewer as AR
+    p = AR._parse_judge
+    check(p('{"useful": 1, "reason": "有人说话", "event_type": "speech"}')["useful"] == 1,
+          "judge 解析：标准 JSON")
+    check(p('```json\n{"useful": 0, "reason": "风声", "event_type": "noise"}\n```')["useful"] == 0,
+          "judge 解析：```json 围栏")
+    check(p('{"useful": "有用", "reason": "x"}')["useful"] == 1, "judge 解析：中文 useful")
+    check(p('{"useful": 7, "reason": "y"}')["useful"] == 2, "judge 解析：越界值归一为不确定")
+    check(p('没啥结构')["useful"] == 2 and p('没啥结构')["event_type"] == "other",
+          "judge 解析：无 JSON 兜底为不确定")
+
+    # 6.5) 容错：judge 直接收 sqlite3.Row（队列行）不崩
+    #      sqlite3.Row 支持 row["列名"] 但无 .get() —— 入口须 dict(row)，
+    #      曾因 review_one/judge 对 Row 调 .get() 抛 AttributeError
+    import sqlite3
+    _rc = sqlite3.connect(":memory:")
+    _rc.row_factory = sqlite3.Row
+    _rc.execute("CREATE TABLE t (id INT, path TEXT, filename TEXT, has_audio INT,"
+                " duration_sec REAL)")
+    _rc.execute("INSERT INTO t VALUES (1,'C:/no/such.mp4','t.mp4',1,12.5)")
+    _rrow = _rc.execute("SELECT * FROM t").fetchone()
+    ar_row = AudioReviewer({
+        "audio": {"enabled": True, "engine": "funasr", "model_dir": "x"},
+        "llm": {"enabled": True, "endpoint": "http://127.0.0.1:1",  # 立即拒连
+                "model": "qwen3:4b", "timeout": 2},
+        "runtime": {}, "work_dir": "."})
+    try:
+        _rj = ar_row.judge("有人在说话", _rrow)   # 端点拒连 → None，但不抛异常
+        _row_ok = True
+    except AttributeError:
+        _row_ok = False
+    check(_row_ok and (_rj is None or isinstance(_rj, dict)),
+          "容错：judge 收 sqlite3.Row 不抛 AttributeError")
+
+    # 7) UI / jobs 接线（源码级检查，防改 UI 忘接线）
+    ui_src = (Path(__file__).resolve().parent.parent / "src" / "ui.py").read_text(encoding="utf-8")
+    jobs_src = (Path(__file__).resolve().parent.parent / "src" / "jobs.py").read_text(encoding="utf-8")
+    check("def render_audio_card" in ui_src and "render_audio_card(row, cfg)" in ui_src,
+          "UI：审核台已挂载音频复核卡")
+    check("confirm_skip_audio" in ui_src and "disabled=not confirm_skip_audio" in ui_src,
+          "UI：确认清理带音频复核关口")
+    check("b_gate_ok" in ui_src and "disabled=(not selected or not b_gate_ok)" in ui_src,
+          "UI：批量移入带音频复核关口")
+    check('_AUDIO = "audio"' in jobs_src and "音频复核" in jobs_src
+          and "start_audio_review" in jobs_src,
+          "jobs：音频复核任务类型注册")
+    check("jobsmod.get_audio_job()" in ui_src,
+          "UI：进度页接入音频任务面板（get_audio_job 被引用）")
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -506,6 +642,7 @@ def main() -> int:
     test_no_delete_calls()
     test_config_resilience()
     test_grid_select_all()
+    test_audio_review()
 
     print()
     print("=" * 66)

@@ -97,9 +97,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_image_side": 1280,
     },
 
+    # ---------------------------------------------------------------- 音频复核 L2.5
+    # 视觉判定"无目标"的删除候选，可能画面无人但画外有人声（电话/对讲/询价/警报）。
+    # 这层在删除前抽音轨 → VAD 人声检测 → ASR 转写 → LLM 判有用性，供人二次确认。
+    "audio": {
+        "enabled": False,              # 总开关（引擎安装就绪后再开）
+        "engine": "funasr",            # funasr（阿里）/ faster_whisper（降级兜底）
+        "device": "auto",              # auto=有 CUDA 用 GPU 否则 CPU；cuda/cpu 强制。
+                                       # GPU 被其它任务（如 DVR 转码）占满/驱动重置时改 cpu 保复核不饿死
+        "model_dir": str(MODEL_DIR / "audio"),   # fsmn-vad / paraformer 模型目录
+        "whisper_model": "small",      # faster_whisper 降级时的模型规格
+        "language": "zh",              # ASR 语言
+        "sample_seconds": 0,           # 0=抽全量音轨；>0 只抽前 N 秒（快速初筛）
+        "vad_speech_threshold": 0.3,   # 语音占总时长比例低于此值 → "基本无人声"
+        "min_speech_sec": 1.0,         # 单段人声短于该秒数视为噪音段，不转写
+        "punc_model": True,            # 是否启用标点模型 ct-punc（让人好读）
+        "max_segments": 40,            # 单片段最多转写段数，超长截断（控制成本）
+        "cleanup_wav": False,          # 复核落库后是否清理抽出的 wav（要播放则保留）
+    },
+
+    # ---------------------------------------------------------------- LLM 有用性判断
+    # 把 ASR 转写文本 + 元数据送本地 LLM，判断"这段声音内容是否可能有用"。
+    # 结论仅是参考意见，最终由人在审核台拍板。
+    "llm": {
+        "enabled": False,
+        "endpoint": "http://127.0.0.1:11434",   # ollama OpenAI 兼容接口
+        "model": "qwen3:4b",
+        "temperature": 0.1,
+        "timeout": 120,
+    },
+
     # ---------------------------------------------------------------- 运行
     "runtime": {
         "batch_size_limit": 500,     # 单次批量移动上限
+        "default_batch_limit": 200,  # 执行上限（扫描/分析/音频复核共用），启动时记住上次值
         "sqlite_path": str(DATA_DIR / "videos.db"),
         "ffprobe_path": "",          # 留空则自动从 PATH 找
         "ffmpeg_path": "",
