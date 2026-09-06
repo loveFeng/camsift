@@ -421,19 +421,27 @@ class AudioReviewer:
                   progress: Optional[Callable[[int, int, str], None]] = None,
                   log: Optional[Callable[[str], None]] = None,
                   stop_event=None,
-                  batch_id: int | None = None) -> Dict[str, Any]:
-        """对判删候选批量复核。可中断，中断/失败不影响已写入结果。"""
+                  batch_id: int | None = None,
+                  scope: str = "all") -> Dict[str, Any]:
+        """对待清理(trash)+需人工确认(review)候选批量复核，可中断。
+
+        scope: all = 两类都复核（默认）/ trash = 仅待清理 / review = 仅需人工确认。
+        中断/失败不影响已写入结果。
+        """
         if not self.a.get("enabled"):
             return {"error": "音频复核未启用（config.audio.enabled=false）"}
         problems = self.check_ready()
         if problems:
             raise AudioEngineError("；".join(problems[:3]))
         rows = db.audio_review_queue(batch_id=batch_id,
-                                     limit=limit or 1000)
+                                     limit=limit or 1000,
+                                     scope=scope)
         total = len(rows)
         if not total:
+            scope_txt = {"all": "待清理+需人工确认", "trash": "待清理",
+                         "review": "需人工确认"}.get(scope, "待清理+需人工确认")
             if log:
-                log("没有待复核的判删候选（有音轨、未复核、未处置）")
+                log(f"没有待复核的 {scope_txt} 候选（有音轨、未复核、未处置）")
             return {"checked": 0, "total": 0}
         if log:
             log(f"开始音频复核：{total} 段（引擎={self.a.get('engine')}）")

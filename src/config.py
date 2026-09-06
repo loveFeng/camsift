@@ -114,6 +114,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "punc_model": True,            # 是否启用标点模型 ct-punc（让人好读）
         "max_segments": 40,            # 单片段最多转写段数，超长截断（控制成本）
         "cleanup_wav": False,          # 复核落库后是否清理抽出的 wav（要播放则保留）
+        "review_scope": "all",         # 复核范围: all=待清理+需人工确认 / trash=仅待清理
+                                       #          / review=仅需人工确认（先给人看的内容先复核）
     },
 
     # ---------------------------------------------------------------- LLM 有用性判断

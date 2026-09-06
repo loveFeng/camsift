@@ -158,6 +158,12 @@ AUDIO_COLUMNS: Dict[str, str] = {
 }
 
 
+def _scope_sql(scope: str | None) -> str:
+    """复核范围 → verdict 过滤 SQL 片段。默认 all（待清理 + 需人工确认）。"""
+    return {"trash": "= 'trash'", "review": "= 'review'"} \
+        .get(scope or "all", "IN ('trash','review')")
+
+
 class Database:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
@@ -483,9 +489,14 @@ class Database:
             return c.execute(sql, args).fetchone()[0]
 
     def count_audio_pending(self, batch_id: int | None = None,
-                            only_unreviewed: bool = True) -> int:
-        """待音频复核的判删候选数（有音轨 + 未复核 + 尚未人工处置）。"""
-        sql = ("SELECT COUNT(*) FROM videos WHERE verdict IN ('trash','review') "
+                            only_unreviewed: bool = True,
+                            scope: str = "all") -> int:
+        """待音频复核的判删候选数（有音轨 + 未复核 + 尚未人工处置）。
+
+        scope: all = 待清理+需人工确认（默认） / trash = 仅待清理 / review = 仅需人工确认
+        """
+        verdict_sql = _scope_sql(scope)
+        sql = (f"SELECT COUNT(*) FROM videos WHERE verdict {verdict_sql} "
                "AND meta_ok=1 AND has_audio=1")
         args: List[Any] = []
         if only_unreviewed:
@@ -497,9 +508,15 @@ class Database:
             return c.execute(sql, args).fetchone()[0]
 
     def audio_review_queue(self, batch_id: int | None = None, limit: int = 1000,
-                           offset: int = 0) -> List[sqlite3.Row]:
-        """音频复核队列：判删候选按分数升序（最可疑/最该删的优先复核）。"""
-        sql = ("SELECT * FROM videos WHERE verdict IN ('trash','review') "
+                           offset: int = 0, scope: str = "all") -> List[sqlite3.Row]:
+        """音频复核队列：候选按分数升序（最可疑/最该删的优先复核）。
+
+        scope: all = 待清理+需人工确认（默认） / trash = 仅待清理 / review = 仅需人工确认。
+        两类都覆盖 —— trash(待清理) 与 review(需人工确认) 均可经音频复核 + LLM 文字判断
+        捞回画外有声事件。
+        """
+        verdict_sql = _scope_sql(scope)
+        sql = (f"SELECT * FROM videos WHERE verdict {verdict_sql} "
                "AND meta_ok=1 AND has_audio=1 AND audio_checked IS NULL "
                "AND human_decision IS NULL")
         args: List[Any] = []

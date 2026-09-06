@@ -628,6 +628,50 @@ def test_audio_review():
           "jobs：音频复核任务类型注册")
     check("jobsmod.get_audio_job()" in ui_src,
           "UI：进度页接入音频任务面板（get_audio_job 被引用）")
+    check("review_scope" in ui_src and 'scope="trash"' in ui_src and 'scope="review"' in ui_src,
+          "UI：音频复核范围选择（待清理/需人工确认分开展示与启动）")
+    check("scope: str = \"all\"" in jobs_src and "scope=scope" in jobs_src,
+          "jobs：音频复核任务支持范围参数（all/trash/review）")
+
+    # 8) 复核范围过滤（trash 与 review 两类都覆盖，可分别/合并复核）
+    from src.db import _scope_sql
+    check(_scope_sql("all") == "IN ('trash','review')"
+          and _scope_sql("trash") == "= 'trash'"
+          and _scope_sql("review") == "= 'review'"
+          and _scope_sql(None) == "IN ('trash','review')",
+          "范围 → verdict SQL：all 含两类，trash/review 单档，非法回落 all")
+    d2, db2, _, ids2 = _tmp_db(4)   # v0,v1 trash+review 待复核各1
+    try:
+        for v, verdict in ((ids2[0], "trash"), (ids2[1], "review")):
+            db2.upsert_video_meta(db2.get_video(v)["path"], {
+                "filename": db2.get_video(v)["filename"], "rel_dir": "", "year": "2024",
+                "size_bytes": 1, "mtime": 0, "duration_sec": 60,
+                "width": 1920, "height": 1080, "video_codec": "hevc",
+                "has_audio": 1, "audio_energy": None, "bitrate_kbps": 1000,
+                "meta_ok": 1, "meta_error": None})
+            _mark_analyzed(db2, v, verdict, 5.0)
+        check(db2.count_audio_pending() == 2 and db2.count_audio_pending(scope="all") == 2,
+              "范围 all：trash+review 均计入待复核（默认全量覆盖）")
+        check(db2.count_audio_pending(scope="trash") == 1
+              and db2.count_audio_pending(scope="review") == 1,
+              "范围拆分：trash/review 各自计数正确")
+        q_all = {x["id"] for x in db2.audio_review_queue()}
+        q_r = {x["id"] for x in db2.audio_review_queue(scope="review")}
+        check(q_all == {ids2[0], ids2[1]} and q_r == {ids2[1]},
+              "队列过滤：all 含两类；review 只取需人工确认档")
+    finally:
+        shutil.rmtree(d2, ignore_errors=True)
+
+    # 9) fmt_eta 完整时长格式（用户要求不省略，metric 窄列截断时进度条文本保底）
+    from src.ui import fmt_eta
+    _eta_cases = [(0, "0秒"), (45, "45秒"), (90, "1分30秒"), (754, "12分34秒"),
+                  (3600, "1小时00分"), (9000, "2小时30分"), (9375, "2小时36分"),
+                  (86400, "1天0小时00分"), (93750, "1天2小时02分"),
+                  (93750 + 86400 * 2, "3天2小时02分"), (-5, "—"), (None, "—")]
+    for _s, _want in _eta_cases:
+        assert fmt_eta(_s) == _want, f"fmt_eta({_s})={fmt_eta(_s)!r} 期望 {_want!r}"
+    check(all(fmt_eta(s) == w for s, w in _eta_cases),
+          f"fmt_eta 完整时长格式（{len(_eta_cases)} 档位全对，无省略）")
 
 
 def main() -> int:

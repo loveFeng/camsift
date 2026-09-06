@@ -180,20 +180,23 @@ def _run_analyze(job: Job, db, cfg: Dict, limit: Optional[int]) -> None:
 
 
 def _run_audio(job: Job, db, cfg: Dict, limit: Optional[int],
-               batch_id: Optional[int]) -> None:
-    """音频复核：对判删候选（有音轨、未复核）做 VAD+ASR+LLM。"""
+               batch_id: Optional[int], scope: str) -> None:
+    """音频复核：对待清理/需人工确认候选（有音轨、未复核）做 VAD+ASR+LLM。
+
+    scope: all = 两类都复核 / trash = 仅待清理 / review = 仅需人工确认
+    """
     from .audioreview import AudioReviewer, AudioEngineError
     ar = AudioReviewer(cfg)
     problems = ar.check_ready()
     if problems:
         raise AudioEngineError("引擎未就绪：" + "；".join(problems))
-    pending = db.count_audio_pending(batch_id)
+    pending = db.count_audio_pending(batch_id, scope=scope)
     if limit:
         pending = min(pending, limit)
     job.total = pending
     res = ar.run_batch(
         db, limit=limit, progress=_hook(job), log=job.log,
-        stop_event=job._stop, batch_id=batch_id,
+        stop_event=job._stop, batch_id=batch_id, scope=scope,
     )
     job.result = res
     job.processed = res.get("checked", 0) + res.get("errors", 0)
@@ -216,10 +219,14 @@ def start_analyze(db, cfg, limit: Optional[int] = None) -> tuple[bool, str]:
 
 
 def start_audio_review(db, cfg, limit: Optional[int] = None,
-                       batch_id: Optional[int] = None) -> tuple[bool, str]:
-    """启动音频复核后台任务。引擎/依赖未就绪时返回错误信息。"""
+                       batch_id: Optional[int] = None,
+                       scope: str = "all") -> tuple[bool, str]:
+    """启动音频复核后台任务。scope: all=待清理+需人工确认 / trash / review。
+
+    引擎/依赖未就绪时返回错误信息。
+    """
     return MANAGER.start(_AUDIO,
-                         lambda j: _run_audio(j, db, cfg, limit, batch_id))
+                         lambda j: _run_audio(j, db, cfg, limit, batch_id, scope))
 
 
 def get_scan_job() -> Job:

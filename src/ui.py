@@ -209,6 +209,26 @@ def render_audio_card(row, cfg: Dict):
 
 
 # --------------------------------------------------------------------------- 后台任务面板
+def fmt_eta(sec: float) -> str:
+    """秒 → 完整时长，不省略任何一级：2小时34分 / 26小时05分 / 1天3小时05分 / 45秒。
+
+    之前用自适应缩写（如 2.6 小时）且 metric 列窄会被截断，用户看不出确切时间。
+    """
+    if sec is None or sec < 0:
+        return "—"
+    s = int(round(sec))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, sec_ = divmod(s, 60)
+    if d:
+        return f"{d}天{h}小时{m:02d}分"
+    if h:
+        return f"{h}小时{m:02d}分"
+    if m:
+        return f"{m}分{sec_:02d}秒"
+    return f"{sec_}秒"
+
+
 @_fragment(run_every="1s")
 def job_panel(job, title: str, key: str):
     """后台任务实时面板。
@@ -218,15 +238,18 @@ def job_panel(job, title: str, key: str):
     """
     st.markdown(f"**{title}**")
     if job.running:
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+        c1, c2, c3, c4 = st.columns([2.6, 1, 1.1, 1.7])
         c1.caption(f"正在处理：`{job.current or '初始化…'}`")
         c2.metric("已处理", job.processed)
-        c3.metric("速度", f"{job.speed:.1f}/秒")
-        eta = job.eta_sec
-        c4.metric("预计剩余", f"{eta / 60:.1f} 分钟" if eta >= 0 else "—")
+        spd = job.speed
+        # 音频复核速度常 <0.1 段/秒，按"分"显示才看得清（0.0/秒 等于没显示）
+        c3.metric("速度", f"{spd:.1f}/秒" if spd >= 0.1 else f"{spd * 60:.1f} 分/分")
+        eta_txt = fmt_eta(job.eta_sec)
+        c4.metric("预计剩余", eta_txt)
         if job.total:
+            # 剩余时间完整写进进度条文本 —— metric 列过窄时可能被截断，此处保底全量显示
             st.progress(job.progress_ratio,
-                        text=f"{job.processed} / {job.total}")
+                        text=f"{job.processed} / {job.total} · 预计剩余 {eta_txt}")
         else:
             st.caption(f"已处理 {job.processed} 个（总数未知，边扫边统计）")
         if st.button("⏹ 停止任务", key=f"stop_{key}", use_container_width=True):
@@ -242,16 +265,17 @@ def job_panel(job, title: str, key: str):
         elif job.kind == "scan":
             st.success(
                 f"{icon} 扫描完成：新增 {r.get('added', 0)}，跳过 {r.get('skipped', 0)}，"
-                f"失败 {r.get('failed', 0)}，用时 {r.get('seconds', 0):.1f}s"
+                f"失败 {r.get('failed', 0)}，用时 {fmt_eta(r.get('seconds', 0))}"
                 f"（批次 #{r.get('batch_id')}）")
         elif job.kind == "audio":
             st.success(
                 f"{icon} 音频复核完成：{r.get('checked', 0)} 段（检出人声 "
-                f"{r.get('speech', 0)} 段），失败 {r.get('errors', 0)} 段，用时 {job.elapsed:.1f}s")
+                f"{r.get('speech', 0)} 段），失败 {r.get('errors', 0)} 段，"
+                f"用时 {fmt_eta(job.elapsed)}")
         else:
             st.success(
                 f"{icon} 分析完成：成功 {r.get('analyzed', 0)}，失败 {r.get('errors', 0)}"
-                f"（失败项一律保留），用时 {job.elapsed:.1f}s")
+                f"（失败项一律保留），用时 {fmt_eta(job.elapsed)}")
 
     if job.logs:
         with st.expander("任务日志", expanded=(job.status == "error")):
@@ -897,6 +921,20 @@ def tab_settings(db, cfg):
         key="audio_device",
         help="auto=有 GPU 就用 GPU。若 GPU 被 DVR 转码等任务占满、或驱动异常导致复核"
              "卡住（一段几分钟不动），改成 cpu 可稳定跑完（慢 3-5 倍但不会饿死）。")
+    scope_map = {"all": "待清理 + 需人工确认（全部）", "trash": "仅待清理（判定清理）",
+                 "review": "仅需人工确认（边界片段）"}
+    cur_scope = str(ac.get("review_scope", "all"))
+    a_scope = st.radio(
+        "复核范围（两类都经 音频复核 + LLM 文字判断）",
+        list(scope_map.keys()),
+        index=["all", "trash", "review"].index(cur_scope) if cur_scope in scope_map else 0,
+        format_func=lambda k: scope_map[k],
+        key="audio_scope",
+        horizontal=True,
+        help="待清理=分数最低、最可疑的片段；需人工确认=分数居中的边界片段，"
+             "画面无人但最需要靠声音帮你判断留不留。默认全部，两类都会复核。\n"
+             "若你正打算人工审核「需人工确认」的片段，可先选「仅需人工确认」"
+             "单独把这一档跑完，让人工审核时每段都有转写文本可看。")
     st.markdown("**LLM 有用性判断**（需本机 ollama 已安装并拉取模型，如 qwen3:4b）")
     l1, l2, l3 = st.columns(3)
     l_en = l1.checkbox("启用 LLM 判断", bool(cfg["llm"].get("enabled")), key="llm_en")
@@ -911,6 +949,7 @@ def tab_settings(db, cfg):
         ac["device"] = a_dev
         ac["sample_seconds"] = int(a_sample)
         ac["model_dir"] = a_mdir
+        ac["review_scope"] = str(a_scope)
         cfg["llm"]["enabled"] = l_en
         cfg["llm"]["model"] = l_model
         cfg["llm"]["endpoint"] = l_ep
@@ -941,12 +980,17 @@ def tab_settings(db, cfg):
             if problems:
                 st.warning("引擎未就绪，未启动：\n" + "\n".join(f"· {p}" for p in problems))
             else:
-                ok, msg = jobsmod.start_audio_review(db, cfg, int(limit))
+                ok, msg = jobsmod.start_audio_review(db, cfg, int(limit), scope=str(a_scope))
                 st.success(msg) if ok else st.warning(msg)
 
-    n_pending_audio = db.count_audio_pending()
-    st.caption(f"当前待复核判删候选：**{n_pending_audio}** 段（有音轨、未复核、未处置）"
-               " —— 启动后任务自动跳过已复核/无音轨片段，可随时停止，进度写入数据库不丢。")
+    # 待复核计数按范围拆开显示（两类一目了然）
+    n_trash = db.count_audio_pending(scope="trash")
+    n_review = db.count_audio_pending(scope="review")
+    scope_txt = scope_map.get(str(a_scope), scope_map["all"])
+    st.caption(
+        f"当前待复核：**待清理 {n_trash}** 段 + **需人工确认 {n_review}** 段"
+        f"（均有音轨、未复核、未处置）。当前范围：**{scope_txt}** —— 启动后自动跳过"
+        "已复核/无音轨片段，可随时停止，进度写入数据库不丢。")
 
     st.divider()
     st.markdown("##### 导出清单")
