@@ -75,6 +75,7 @@ class AudioReviewer:
         self._engine = None            # funasr 引擎缓存
         self._asr_engine = None        # faster_whisper 缓存
         self._warned: set = set()
+        self.last_dsp_wav: Optional[Path] = None   # 最近一次生成的降噪副本（cleanup 用）
 
     # ------------------------------------------------------------------ 工具
     def _ffmpeg(self) -> str:
@@ -227,44 +228,35 @@ class AudioReviewer:
         vad, asr, _ = self._load_engine()
         dur = duration_sec or self._wav_duration(wav)
 
-        # 1) VAD 人声分段。funasr 输出形如 [{'key':…, 'value': [[s_ms,e_ms],…]}] 或
-        #    [{'value': …}]；低版本也可能直接是 [[s,e],…]。宽容解析。
-        raw = vad.generate(input=str(wav),
-                           speech_noise_thres=float(self.a.get("vad_speech_noise_thres", 0.6)))
-        segs_ms: List[List[int]] = []
-        for item in raw if isinstance(raw, (list, tuple)) else [raw]:
-            v = item.get("value") if isinstance(item, dict) else None
-            if isinstance(v, list):
-                for pair in v:
-                    if (isinstance(pair, (list, tuple)) and len(pair) >= 2
-                            and isinstance(pair[0], (int, float))):
-                        segs_ms.append([int(pair[0]), int(pair[1])])
-            elif isinstance(item, (list, tuple)) and item and isinstance(item[0], (list, tuple)):
-                segs_ms = [[int(x[0]), int(x[1])] for x in item]
-        segs_ms = [s for s in segs_ms if s[1] > s[0]]
-
-        min_sec = float(self.a.get("min_speech_sec", 1.0))
-        segs_ms = [s for s in segs_ms if (s[1] - s[0]) / 1000.0 >= min_sec]
-        speech_sec = sum((b - a) / 1000.0 for a, b in segs_ms)
-        ratio = min(1.0, speech_sec / dur) if dur > 0 else 0.0
+        # ── 三级流水线（2026-09-06 真实案例驱动：2015 DVR 8kHz 音频有人说话，
+        #    原始 VAD 整段漏检判 0%）──
+        # 1 级：原始音频 VAD（正常文件在此命中，零额外开销）
+        # 2 级：VAD 空 → ffmpeg 降噪副本再 VAD（低保真 DVR 音频，实测 0%→30%+）
+        # 3 级：仍空 → 整段 ASR 兜底（降噪版优先，抑制噪声幻觉；最终不漏检保障）
+        segs_ms = self._vad_segments(vad, wav)
+        asr_wav, dsp_wav = wav, None
+        self.last_dsp_wav = None
+        if not segs_ms:
+            dsp_wav = self._denoise_wav(wav)
+            if dsp_wav is not None:
+                self.last_dsp_wav = dsp_wav
+                segs_ms = self._vad_segments(vad, dsp_wav)
+                if segs_ms:
+                    asr_wav = dsp_wav     # 降噪版信噪比更高，ASR 更准
+        vad_missed = not segs_ms
+        if vad_missed and dsp_wav is not None:
+            asr_wav = dsp_wav             # 整段兜底也用降噪版，减少幻觉转写
 
         # 2) 有语音段才跑 ASR（省算力，避免对纯噪声做无谓转写）
-        #    VAD 兜底：fsmn-vad 对部分 DVR 低保真音频（8kHz 采样+底噪）会整段漏检
-        #    （实测 2015 年监控视频"明明有人说话"VAD 返回空）。此时强制整段 ASR，
-        #    转写出有效文字则视为有语音——宁可多转写一次，不可漏检真说话。
-        vad_missed = not segs_ms
+        #    VAD 兜底：fsmn-vad 漏检时强制整段 ASR，转写出有效文字则视为有语音
+        #    ——宁可多转写一次，不可漏检真说话。
         text = ""
         if segs_ms or vad_missed:
-            raw_asr = asr.generate(input=str(wav))
-            texts = []
-            for item in raw_asr if isinstance(raw_asr, (list, tuple)) else [raw_asr]:
-                if isinstance(item, dict) and item.get("text"):
-                    texts.append(str(item["text"]).strip())
-                elif isinstance(item, str) and item.strip():
-                    texts.append(item.strip())
-            text = "\n".join(t for t in texts if t)
+            text = self._asr_text(asr, asr_wav)
 
         speech_present = 1 if segs_ms else 0
+        speech_sec = sum((b - a) / 1000.0 for a, b in segs_ms)
+        ratio = min(1.0, speech_sec / dur) if (segs_ms and dur > 0) else 0.0
         # 纯噪声被 VAD 放过但 ASR 空转写 → 视为无人声
         if speech_present and not text.strip():
             if ratio < float(self.a.get("vad_speech_threshold", 0.3)):
@@ -289,6 +281,60 @@ class AudioReviewer:
                 [{"start": a / 1000.0, "end": b / 1000.0, "text": ""}
                  for a, b in segs_ms], ensure_ascii=False),
         }
+
+    # ------------------------------------------------------------------ 流水线级
+    def _vad_segments(self, vad, wav: Path) -> List[List[int]]:
+        """跑 VAD 并解析为人声分段（毫秒），过滤短于 min_speech_sec 的段。"""
+        # funasr 输出形如 [{'key':…, 'value': [[s_ms,e_ms],…]}] 或
+        # [{'value': …}]；低版本也可能直接是 [[s,e],…]。宽容解析。
+        raw = vad.generate(input=str(wav),
+                           speech_noise_thres=float(self.a.get("vad_speech_noise_thres", 0.6)))
+        segs_ms: List[List[int]] = []
+        for item in raw if isinstance(raw, (list, tuple)) else [raw]:
+            v = item.get("value") if isinstance(item, dict) else None
+            if isinstance(v, list):
+                for pair in v:
+                    if (isinstance(pair, (list, tuple)) and len(pair) >= 2
+                            and isinstance(pair[0], (int, float))):
+                        segs_ms.append([int(pair[0]), int(pair[1])])
+            elif isinstance(item, (list, tuple)) and item and isinstance(item[0], (list, tuple)):
+                segs_ms = [[int(x[0]), int(x[1])] for x in item]
+        segs_ms = [s for s in segs_ms if s[1] > s[0]]
+        min_sec = float(self.a.get("min_speech_sec", 1.0))
+        return [s for s in segs_ms if (s[1] - s[0]) / 1000.0 >= min_sec]
+
+    def _denoise_wav(self, wav: Path) -> Optional[Path]:
+        """生成降噪副本（与原 wav 同目录，*.dsp.wav），失败/未配置返回 None。"""
+        filt = (self.a.get("dsp_filter") or "").strip()
+        if not filt:
+            return None
+        out = wav.with_name(wav.stem + ".dsp.wav")
+        if out.exists():          # 已生成则复用（断点续跑友好）
+            return out
+        cmd = [self._ffmpeg(), "-y", "-i", str(wav), "-af", filt, str(out)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode != 0 or not out.exists() or out.stat().st_size < 44:
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        return out
+
+    @staticmethod
+    def _asr_text(asr, wav: Path) -> str:
+        """整段 ASR，聚合出转写文本。"""
+        raw_asr = asr.generate(input=str(wav))
+        texts = []
+        for item in raw_asr if isinstance(raw_asr, (list, tuple)) else [raw_asr]:
+            if isinstance(item, dict) and item.get("text"):
+                texts.append(str(item["text"]).strip())
+            elif isinstance(item, str) and item.strip():
+                texts.append(item.strip())
+        return "\n".join(t for t in texts if t)
 
     def _review_fw(self, wav: Path, duration_sec: float | None) -> Dict[str, Any]:
         model = self._engine_fw()
@@ -435,6 +481,8 @@ class AudioReviewer:
         if self.a.get("cleanup_wav"):
             try:
                 wav.unlink()  # AUDIT-OK：清理自产中间产物
+                if self.last_dsp_wav:            # 降噪副本一并清理
+                    self.last_dsp_wav.unlink(missing_ok=True)
             except OSError:
                 pass
         return {"id": vid, "speech": result.get("speech_present", 0),

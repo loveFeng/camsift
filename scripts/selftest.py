@@ -713,6 +713,39 @@ def test_audio_review():
           and r["speech_segments"] == "[[1.0, 9.0]]",
           "VAD 正常检出路径不受兜底影响（按段计时长）")
 
+    # 10.1) 三级流水线第 2 级：原始 VAD 空 → 降噪副本再 VAD → 按段 ASR
+    def _mk_ar2(vad_map, asr_text, **audio_extra):
+        audio = {"engine": "funasr", "min_speech_sec": 1.0,
+                 "vad_speech_threshold": 0.3, "min_transcript_chars": 4}
+        audio.update(audio_extra)
+        ar = AR2({"audio": audio, "llm": {"enabled": False}, "runtime": {}, "work_dir": "."})
+        class _V:
+            @staticmethod
+            def generate(input, **kw):
+                return [{"key": "k", "value": [list(s) for s in vad_map.get(input, [])]}]
+        class _A:
+            @staticmethod
+            def generate(input, **kw):
+                return [{"key": "k", "text": asr_text}]
+        ar._load_engine = lambda: (_V, _A, None)
+        ar._denoise_wav = lambda w: w.with_name(w.stem + ".dsp.wav")
+        return ar
+
+    orig, dspf = Path("unused.wav"), Path("unused.dsp.wav")
+    ar2 = _mk_ar2({str(orig): [], str(dspf): [[2000, 12000]]}, "降噪后检出的语音")
+    r = ar2.review_wav(orig, 20.0)
+    check(r["speech_present"] == 1 and abs(r["speech_ratio"] - 0.5) < 0.01
+          and r["speech_segments"] == "[[2.0, 12.0]]"
+          and ar2.last_dsp_wav == dspf,
+          "三级流水线 L2：原始 VAD 空 → 降噪副本 VAD 检出 → 对副本按段 ASR")
+    # dsp_filter 置空 → 跳过第 2 级直接整段兜底（用原始 wav）
+    ar3 = _mk_ar({str(orig): [], str(dspf): []}, "整段兜底转写", dsp_filter="")
+    ar3._denoise_wav = lambda w: None
+    r = ar3.review_wav(orig, 20.0)
+    check(r["speech_present"] == 1 and r["speech_segments"] == "[[0.0, 20.0]]"
+          and ar3.last_dsp_wav is None,
+          "dsp_filter 置空：跳过降噪级，直接整段 ASR 兜底")
+
 
 def main() -> int:
     cfg = load_config()
