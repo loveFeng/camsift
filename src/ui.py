@@ -13,6 +13,7 @@ Streamlit 审核工作台
 """
 from __future__ import annotations
 
+import html as htmllib
 import json
 import os
 import platform
@@ -541,6 +542,54 @@ def tab_review(db, cfg):
 
 
 # --------------------------------------------------------------------------- 页签 2
+# 批量浏览格子里的音频摘要样式。九宫格每格很窄，转写必须限高截断，
+# 全文挂 title 由浏览器 hover 弹出（比塞进格子可读得多）。
+_GRID_AUDIO_CSS = """
+<style>
+.g-aud{font-size:.76rem;line-height:1.35;margin:2px 0 5px;word-break:break-all;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.g-aud-sp{color:#ff9f1c;font-weight:600}
+.g-aud-none{color:#8892a0}
+.g-aud-wait{color:#8892a0;font-style:italic}
+</style>
+"""
+
+# LLM 有用性在格子里的紧凑标记（与审核台三态一致）
+_LLM_TAG = {1: "🟢有用", 0: "⚪无用", 2: "🟡不定"}
+
+
+def _grid_audio_html(row) -> str:
+    """批量浏览格子下方的音频信息行：有人声则高亮「占比 + 转写」，否则说明状态。
+
+    返回 HTML 片段；无音轨时返回空串（整行不渲染，避免给静音片段加噪音）。
+    """
+    if not row["has_audio"]:
+        return ""
+    ac = row["audio_checked"]
+    if ac is None or ac == 0:
+        return "<div class='g-aud g-aud-wait'>🎧 未音频复核</div>"
+    if ac == -1:
+        err = htmllib.escape(str(row["audio_error"] or "跳过"))
+        return f"<div class='g-aud g-aud-wait' title='{err}'>🎧 跳过复核</div>"
+
+    sp = bool(row["speech_present"])
+    ratio = float(row["speech_ratio"] or 0.0)
+    txt = (row["transcript_text"] or "").strip()
+    if not sp and not txt:
+        return f"<div class='g-aud g-aud-none'>🔇 无人声（占比 {ratio * 100:.0f}%）</div>"
+
+    tag = _LLM_TAG.get(row["llm_useful"], "")
+    head = f"🔊 {ratio * 100:.0f}%" if sp else "🔊 转写"
+    if tag:
+        head += f" {tag}"
+    shown = htmllib.escape(txt) if txt else "<i>（转写为空）</i>"
+    full = htmllib.escape(txt or "转写为空")
+    if len(full) > 400:
+        full = full[:400] + "…"
+    cls = "g-aud-sp" if sp else "g-aud-none"
+    return f"<div class='g-aud {cls}' title='{full}'>{head}　{shown}</div>"
+
+
 def _grid_sel_all(page_ids):
     """「全选本页」回调：在脚本体执行前置位本页每个格子的复选框状态，
     rerun 后格子才会真正呈现勾选态（带 key 的组件 value= 只在首次实例化生效）。"""
@@ -561,7 +610,24 @@ def tab_grid(db, cfg):
 
     st.session_state.setdefault("grid_page", 0)
     st.session_state.setdefault("selected", set())
-    total = db.count_review_queue()
+    st.session_state.setdefault("grid_show_audio", True)
+    st.session_state.setdefault("grid_speech_only", False)
+
+    f1, f2, f3 = st.columns([1.2, 1.2, 3])
+    with f1:
+        st.checkbox("🎧 显示音频转写", key="grid_show_audio")
+    with f2:
+        st.checkbox("仅看检出人声", key="grid_speech_only",
+                    on_change=lambda: st.session_state.update(grid_page=0),
+                    help="只列出音频复核确认有说话内容的片段 —— 画外可能有人声事件，"
+                         "清理前值得单独过一遍")
+
+    with f3:
+        n_sp = db.count_review_queue(speech_only=True)
+        st.caption(f"待审核中 **{n_sp}** 段检出人声（画外可能有事件，"
+                   "清理前建议先看转写）")
+
+    total = db.count_review_queue(speech_only=st.session_state.grid_speech_only)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     st.session_state.grid_page = min(st.session_state.grid_page, pages - 1)
 
@@ -583,10 +649,15 @@ def tab_grid(db, cfg):
             st.session_state.grid_page += 1
             st.rerun()
 
-    rows = db.review_queue(limit=PAGE_SIZE, offset=st.session_state.grid_page * PAGE_SIZE)
+    rows = db.review_queue(limit=PAGE_SIZE,
+                           offset=st.session_state.grid_page * PAGE_SIZE,
+                           speech_only=st.session_state.grid_speech_only)
     if not rows:
-        st.info("没有待审核片段")
+        st.info("没有检出人声的待审核片段" if st.session_state.grid_speech_only
+                else "没有待审核片段")
         return
+
+    st.markdown(_GRID_AUDIO_CSS, unsafe_allow_html=True)
 
     selected = st.session_state.selected
     # 清理已离开本页且未被选中的残留复选框键（移动/保留后视频会退出队列，
@@ -610,6 +681,10 @@ def tab_grid(db, cfg):
                 score = row["final_score"] if row["final_score"] is not None else row["retention_score"]
                 tier = mover.decide_tier(row, cfg)
                 st.caption(f"`{score:g}分` {tier}档　{row['filename'][:24]}")
+                if st.session_state.grid_show_audio:
+                    ah = _grid_audio_html(row)
+                    if ah:
+                        st.markdown(ah, unsafe_allow_html=True)
                 if st.checkbox("选择", key=f"g_{row['id']}", value=row["id"] in selected):
                     selected.add(row["id"])
                 elif row["id"] in selected:

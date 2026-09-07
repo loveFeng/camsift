@@ -873,6 +873,85 @@ def _pcol(db):
             c.close()
 
 
+def test_grid_audio_text():
+    """批量浏览展示音频转写（2026-09-07）：格子内摘要 + 仅看检出人声筛选。
+
+    场景：画面被判删的片段，画外可能有人声事件。九宫格原来只显示「分数/档位/文件名」，
+    用户必须逐条点进审核台才能看到说了什么——等于把最关键的信息藏起来了。
+    """
+    section("批量浏览 音频转写展示")
+
+    # 1) 源码接线：格子内必须渲染音频行，且受开关控制
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    seg = ui_src[ui_src.index("def tab_grid"):]
+    seg = seg[:seg.index("def tab_", 5)] if "def tab_" in seg[5:] else seg
+    check("_grid_audio_html(row)" in seg and "unsafe_allow_html=True" in seg,
+          "格子内渲染音频摘要行（HTML 片段）")
+    check('st.checkbox("🎧 显示音频转写", key="grid_show_audio")' in seg,
+          "提供「显示音频转写」开关（默认开）")
+    check("st.checkbox(\"仅看检出人声\"" in seg
+          and "speech_only=st.session_state.grid_speech_only" in seg,
+          "提供「仅看检出人声」筛选并透传 SQL")
+    check("st.markdown(_GRID_AUDIO_CSS" in seg, "注入格子音频摘要样式")
+
+    from src.ui import _grid_audio_html
+
+    # 2) 四种状态的渲染分支
+    d, db, bid, ids = _tmp_db(5)
+    try:
+        for i in ids:
+            _mark_analyzed(db, i)
+        # _tmp_db 造的是无音轨记录，这里统一标成有音轨（否则音频行不渲染）
+        with db.conn() as c:
+            c.execute("UPDATE videos SET has_audio=1")
+
+        def _mk(vid, **kw):
+            db.update_audio_review(vid, kw)
+            return db.get_video(vid)
+
+        # 无人声
+        r0 = _mk(ids[0], speech_present=0, speech_ratio=0.0, audio_checked=1)
+        h0 = _grid_audio_html(r0)
+        check("无人声" in h0 or h0 == "", "无人声：显示「无人声」或不占版面")
+        check(bool(r0["has_audio"]) is False or "g-aud-none" in h0,
+              "无人声用弱化样式（g-aud-none）")
+
+        # 有人声 + 转写
+        r1 = _mk(ids[1], speech_present=1, speech_ratio=0.257, audio_checked=1,
+                 transcript_text="你是干嘛来啊？")
+        h1 = _grid_audio_html(r1)
+        check("g-aud-sp" in h1 and "26%" in h1 and "你是干嘛来啊？" in h1,
+              "有人声：高亮样式 + 占比 + 转写文本都在格子里")
+        check("你是干嘛来啊？" in h1.split("title=")[-1][:80],
+              "转写全文挂 title（hover 可看完整内容）")
+
+        # 未复核
+        r2 = db.get_video(ids[2])
+        h2 = _grid_audio_html(r2)
+        check("未音频复核" in h2, f"未复核：提示「未音频复核」（got {h2[:40]!r}）")
+
+        # HTML 转义（转写里含尖括号/引号不能破坏结构）
+        r3 = _mk(ids[3], speech_present=1, speech_ratio=0.5, audio_checked=1,
+                 transcript_text='<script>"x"</script>')
+        h3 = _grid_audio_html(r3)
+        check("<script>" not in h3 and "&lt;script&gt;" in h3,
+              "转写内容做 HTML 转义（防注入/破版）")
+
+        # 3) 仅看检出人声：SQL 层过滤，分页计数与结果一致
+        db.update_audio_review(ids[4], {"speech_present": 1, "speech_ratio": 0.4,
+                                        "audio_checked": 1, "transcript_text": "喂"})
+        n_all = db.count_review_queue()
+        n_sp = db.count_review_queue(speech_only=True)
+        q_sp = db.review_queue(limit=100, speech_only=True)
+        check(n_sp < n_all and n_sp >= 1,
+              f"speech_only 计数生效（全部 {n_all} → 有人声 {n_sp}）")
+        check(len(q_sp) == n_sp, "speech_only 分页计数与实际取数一致")
+        check(all(r["speech_present"] == 1 for r in q_sp),
+              "speech_only 结果集只含检出人声的行")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -887,6 +966,7 @@ def main() -> int:
     test_grid_select_all()
     test_audio_review()
     test_archive()
+    test_grid_audio_text()
 
     print()
     print("=" * 66)

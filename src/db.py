@@ -467,12 +467,19 @@ class Database:
             return c.execute(sql, args).fetchall()
 
     def review_queue(self, batch_id: int | None = None, limit: int = 200,
-                     only_unreviewed: bool = True, offset: int = 0) -> List[sqlite3.Row]:
-        """审核队列：按最终分升序 —— 最可疑的排最前。offset 用于分页。"""
+                     only_unreviewed: bool = True, offset: int = 0,
+                     speech_only: bool = False) -> List[sqlite3.Row]:
+        """审核队列：按最终分升序 —— 最可疑的排最前。offset 用于分页。
+
+        speech_only=True 时只看「音频复核检出人声」的片段——画面被判删但画外
+        可能有人声事件，清理前值得单独过一遍。
+        """
         sql = "SELECT * FROM videos WHERE verdict IN ('trash','review') AND meta_ok=1"
         args: List[Any] = []
         if only_unreviewed:
             sql += " AND human_decision IS NULL"
+        if speech_only:
+            sql += " AND audio_checked=1 AND speech_present=1"
         if batch_id:
             sql += " AND batch_id=?"
             args.append(batch_id)
@@ -482,11 +489,14 @@ class Database:
             return c.execute(sql, args).fetchall()
 
     def count_review_queue(self, batch_id: int | None = None,
-                           only_unreviewed: bool = True) -> int:
+                           only_unreviewed: bool = True,
+                           speech_only: bool = False) -> int:
         sql = "SELECT COUNT(*) FROM videos WHERE verdict IN ('trash','review') AND meta_ok=1"
         args: List[Any] = []
         if only_unreviewed:
             sql += " AND human_decision IS NULL"
+        if speech_only:
+            sql += " AND audio_checked=1 AND speech_present=1"
         if batch_id:
             sql += " AND batch_id=?"
             args.append(batch_id)
