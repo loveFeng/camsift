@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -952,6 +953,67 @@ def test_grid_audio_text():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_grid_video_play():
+    """批量浏览调系统播放器（2026-09-07）：静态缩略图不足以判断画面，必须能看动态。
+
+    红线复核：这些入口只能"打开"，绝不能删除/移动原文件。
+    """
+    section("批量浏览 系统播放器入口")
+
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    seg = ui_src[ui_src.index("def tab_grid"):]
+    seg = seg[:seg.index("def tab_", 5)] if "def tab_" in seg[5:] else seg
+
+    check('st.button("▶ 播放", key=f"p_{row[\'id\']}"' in seg,
+          "格子内「▶ 播放」按钮（按 id 唯一 key）")
+    check('st.button("📂 定位", key=f"f_{row[\'id\']}"' in seg,
+          "格子内「📂 定位」按钮（按 id 唯一 key）")
+    check("current_video_path(row)" in seg and "open_in_player(str(vp))" in seg,
+          "播放走 current_video_path 探测 + 系统播放器")
+    check(seg.count('st.error("原文件已不存在') >= 2,
+          "文件缺失时明确报错，不静默失败")
+    check('k.startswith(("g_", "p_", "f_"))' in seg,
+          "翻页残留键清理覆盖新增的播放/定位按钮键")
+    # 审核台同步：已移入回收目录的文件原本会被误报"不存在"
+    rev = ui_src[ui_src.index("def tab_review"):]
+    rev = rev[:rev.index("def tab_grid")]
+    check("vp = current_video_path(row)" in rev,
+          "审核台播放按钮同样走路径探测（移动后仍可播）")
+
+    from src.ui import current_video_path, open_in_player, reveal_in_explorer
+
+    # 路径探测：源 / 回收 / 都没有 / 两边都在
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    d = Path(tempfile.mkdtemp(prefix="vs_play_"))
+    try:
+        src = d / "a.mp4"; src.write_bytes(b"x")
+        trash = d / "b.mp4"; trash.write_bytes(b"x")
+
+        def _row(p, t):
+            return con.execute("SELECT ? AS path, ? AS trash_path",
+                               (p, t)).fetchone()
+
+        check(current_video_path(_row(str(src), None)) == src,
+              "未移动：用源路径")
+        check(current_video_path(_row(str(d / "gone.mp4"), str(trash))) == trash,
+              "已移入回收目录：源路径失效后自动回退回收路径")
+        check(current_video_path(_row(str(d / "gone.mp4"), None)) is None,
+              "两边都不存在：返回 None（由调用方报错）")
+        check(current_video_path(_row(str(src), str(trash))) == src,
+              "两边都在：优先源路径")
+
+        # 红线：这些入口只读打开，不得删除
+        import inspect
+        for fn in (open_in_player, reveal_in_explorer):
+            body = inspect.getsource(fn)
+            check(not any(w in body for w in ("unlink", "remove(", "rmtree", "shutil")),
+                  f"{fn.__name__} 不含任何删除调用")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        con.close()
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -967,6 +1029,7 @@ def main() -> int:
     test_audio_review()
     test_archive()
     test_grid_audio_text()
+    test_grid_video_play()
 
     print()
     print("=" * 66)

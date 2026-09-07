@@ -76,6 +76,36 @@ def open_in_player(path: str):
         st.warning(f"无法调用系统播放器：{e}")
 
 
+def reveal_in_explorer(path: str):
+    """在文件管理器中定位该文件（Windows 下选中文件本身，便于周边查看）。"""
+    p = Path(path)
+    try:
+        if platform.system() == "Windows":
+            subprocess.Popen(["explorer", "/select,", str(p.resolve())])
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", "-R", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p.parent)])
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"无法打开文件管理器：{e}")
+
+
+def current_video_path(row) -> Path | None:
+    """该视频当前实际存在的路径：未移动用源路径，已移入回收目录则用回收路径。
+
+    移动后源路径自然失效，这里逐个 exists() 探测，避免"文件明明在回收目录
+    却报已不存在"。都找不到才返回 None（真被手动删除了）。
+    """
+    keys = row.keys() if hasattr(row, "keys") else ()
+    for key in ("path", "trash_path"):
+        if key not in keys:
+            continue
+        v = row[key]
+        if v and Path(v).exists():
+            return Path(v)
+    return None
+
+
 def make_browser_preview(row, cfg: Dict) -> Path | None:
     """把 H.265 转成浏览器可播的 H.264 预览（H.265 在多数浏览器要靠硬件解码）。"""
     from shutil import which
@@ -444,10 +474,11 @@ def tab_review(db, cfg):
         b1, b2 = st.columns(2)
         with b1:
             if st.button("▶ 用系统播放器打开", use_container_width=True):
-                if Path(row["path"]).exists():
-                    open_in_player(row["path"])
+                vp = current_video_path(row)
+                if vp:
+                    open_in_player(str(vp))
                 else:
-                    st.error("原文件已不存在（可能已被移动）")
+                    st.error("原文件已不存在（源文件与回收目录都找不到）")
         with b2:
             if st.button("🌐 生成网页可播预览", use_container_width=True):
                 with st.spinner("转码中（H.265 → H.264，约需数秒）..."):
@@ -662,8 +693,12 @@ def tab_grid(db, cfg):
     selected = st.session_state.selected
     # 清理已离开本页且未被选中的残留复选框键（移动/保留后视频会退出队列，
     # 若不清除其 g_ 键，撤销回到队列时会呈现"幽灵勾选"）。
+    # 清理已离开本页且未被选中的残留复选框键（移动/保留后视频会退出队列，
+    # 若不清除其 g_ 键，撤销回到队列时会呈现"幽灵勾选"）。p_/f_ 是播放/定位
+    # 按钮键，一并回收避免随翻页无限累积。
     visible_ids = {r["id"] for r in rows}
-    for k in [k for k in st.session_state.keys() if k.startswith("g_")]:
+    for k in [k for k in st.session_state.keys()
+              if k.startswith(("g_", "p_", "f_"))]:
         try:
             vid = int(k[2:])
         except ValueError:
@@ -685,10 +720,34 @@ def tab_grid(db, cfg):
                     ah = _grid_audio_html(row)
                     if ah:
                         st.markdown(ah, unsafe_allow_html=True)
-                if st.checkbox("选择", key=f"g_{row['id']}", value=row["id"] in selected):
-                    selected.add(row["id"])
-                elif row["id"] in selected:
-                    selected.discard(row["id"])
+
+                # 静态缩略图不足以判断画面内容 —— 直接调系统播放器 / 资源管理器
+                pb, fb, cb = st.columns([1, 1, 1.3])
+                with pb:
+                    if st.button("▶ 播放", key=f"p_{row['id']}",
+                                 help="用系统默认播放器打开原视频",
+                                 use_container_width=True):
+                        vp = current_video_path(row)
+                        if vp:
+                            open_in_player(str(vp))
+                            st.toast(f"已调用播放器：{vp.name}", icon="▶")
+                        else:
+                            st.error("原文件已不存在（可能已被手动删除）")
+                with fb:
+                    if st.button("📂 定位", key=f"f_{row['id']}",
+                                 help="在文件管理器中定位该文件",
+                                 use_container_width=True):
+                        vp = current_video_path(row)
+                        if vp:
+                            reveal_in_explorer(str(vp))
+                        else:
+                            st.error("原文件已不存在（可能已被手动删除）")
+                with cb:
+                    if st.checkbox("选择", key=f"g_{row['id']}",
+                                   value=row["id"] in selected):
+                        selected.add(row["id"])
+                    elif row["id"] in selected:
+                        selected.discard(row["id"])
     st.session_state.selected = selected
 
     st.divider()
