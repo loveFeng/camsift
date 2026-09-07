@@ -1035,6 +1035,59 @@ def tab_settings(db, cfg):
     with p2:
         job_panel(aj, "🤖 AI 分析", "analyze")
 
+    # ------------------------------------------------------------ 重新分析
+    st.divider()
+    st.markdown("##### 🔄 改了判定参数？重新分析")
+    st.caption(
+        "分析队列只处理**未分析过**的记录，所以改完阈值直接点「启动 AI 分析」"
+        "不会有任何反应 —— 需要先把已分析的记录**退回待分析**状态。\n\n"
+        "退回只清除机器分析结果（分数/判定/依据），**不动视频文件、不删记录**，"
+        "人工处置决定（保留/移入回收）也默认保留。耗时与首次分析相当。")
+
+    n_und = db.count_resettable("undecided")
+    n_err = db.count_resettable("failed")
+    n_all = db.count_resettable("all")
+    scope = st.radio(
+        "退回范围",
+        ["undecided", "failed", "all"],
+        format_func=lambda s: {
+            "undecided": f"仅未人工处置的（{n_und} 条）—— 推荐，不动你的决定",
+            "failed": f"仅分析失败的（{n_err} 条）—— 修好环境后重试",
+            "all": f"全部（{n_all} 条，含已人工处置的）—— 会覆盖人工结论",
+        }[s],
+        key="reset_scope", horizontal=False)
+
+    n_sel = {"undecided": n_und, "failed": n_err, "all": n_all}[scope]
+    danger = (scope == "all")
+    go = True
+    if danger:
+        go = st.checkbox(
+            f"我明白：已人工处置的 {n_all - n_und} 条会被机器重新判定，"
+            "原先标「保留」的可能被改判为「建议清理」（文件位置不变）",
+            key="reset_all_ok")
+    r1, r2 = st.columns([1.4, 1.6])
+    with r1:
+        if st.button("↩ 退回待分析", use_container_width=True,
+                     disabled=(n_sel == 0 or not go or aj.running)):
+            n = db.reset_analysis(scope)
+            st.success(f"已把 **{n}** 条退回待分析状态。"
+                       "现在点上面的「🤖 启动 AI 分析」即可用新参数重跑。")
+            st.rerun()
+    with r2:
+        if st.button("🔄 退回并立即重跑分析", type="primary", use_container_width=True,
+                     disabled=(n_sel == 0 or not go or aj.running)):
+            n = db.reset_analysis(scope)
+            cfg["runtime"]["default_batch_limit"] = int(limit)
+            save_config(cfg)
+            ok, msg = jobsmod.start_analyze(db, cfg, int(limit))
+            st.success(f"已退回 **{n}** 条并启动分析（用新参数）。") if ok \
+                else st.warning(msg)
+            st.rerun()
+    if n_sel == 0:
+        st.caption("该范围内没有可退回的记录。")
+    if aj.running:
+        st.caption("分析任务正在运行，结束后才能退回。")
+
     st.divider()
     st.markdown("##### 🔊 音频复核（L2.5 有声事件捞回）")
     st.caption(

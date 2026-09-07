@@ -455,6 +455,61 @@ class Database:
         with self.conn() as c:
             return c.execute(sql, args).fetchall()
 
+    # ---------------------------------------------------------------- 重新分析
+    # 改了判定阈值（YOLO 置信度、动静阈值…）后，已分析过的记录必须退回待分析才会重跑：
+    # 分析队列只取 status IN ('metadata','pending')，analyzed/keep/trash 都不在里面。
+    RESET_SCOPES = ("undecided", "failed", "all")
+
+    def count_resettable(self, scope: str = "undecided",
+                         batch_id: int | None = None) -> int:
+        """可退回待分析的条数。scope: undecided / failed / all（见 reset_analysis）。"""
+        sql, args = self._reset_where(scope, batch_id)
+        with self.conn() as c:
+            return c.execute("SELECT COUNT(*) FROM videos WHERE " + sql, args).fetchone()[0]
+
+    def reset_analysis(self, scope: str = "undecided",
+                       batch_id: int | None = None) -> int:
+        """把已分析记录退回待分析状态（改参数后重跑用），返回重置条数。
+
+        undecided  未人工处置的（analyzed/error）—— 默认，不动人工结论
+        failed     仅分析失败的（status='error'）
+        all        全部已分析，含已人工处置的 —— 会覆盖人工结论，UI 需二次确认
+
+        只清 L1 分析产物；VLM 复核字段与人工处置字段保留（前者不依赖画面阈值，
+        后者是人的决定）。绝不触碰文件，也绝不删行。
+        """
+        if scope not in self.RESET_SCOPES:
+            raise ValueError(f"未知 reset scope: {scope}")
+        where, args = self._reset_where(scope, batch_id)
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE videos SET status=?, sampled_frames=0, has_person=NULL, "
+                "person_conf=NULL, has_vehicle=NULL, vehicle_conf=NULL, "
+                "has_animal=NULL, motion_area_ratio=NULL, raw_detections=NULL, "
+                "frame_stats=NULL, retention_score=NULL, verdict=NULL, "
+                "decision_trace=NULL, analyzed_at=NULL, analyze_error=NULL, "
+                "final_score=NULL WHERE " + where,
+                [STATUS_METADATA] + args)
+            n = cur.rowcount
+        if batch_id:
+            self.refresh_batch_progress(batch_id)
+        return n
+
+    def _reset_where(self, scope: str, batch_id: int | None) -> tuple[str, list]:
+        """reset/count 共用的 WHERE 片段（不含 WHERE 关键字）。"""
+        base = "meta_ok=1 AND status NOT IN (?,?)"
+        args: List[Any] = [STATUS_PENDING, STATUS_METADATA]
+        if scope == "failed":
+            base += " AND status=?"
+            args.append(STATUS_ERROR)
+        elif scope == "undecided":
+            base += " AND human_decision IS NULL"
+        # scope == "all"：不额外限制（含已人工处置的，由 UI 层把关确认）
+        if batch_id:
+            base += " AND batch_id=?"
+            args.append(batch_id)
+        return base, args
+
     def iter_pending_analysis(self, batch_id: int | None = None, limit: int = 1000) -> List[sqlite3.Row]:
         sql = "SELECT * FROM videos WHERE status IN ('metadata','pending') AND meta_ok=1"
         args: List[Any] = []

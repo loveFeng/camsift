@@ -1014,6 +1014,81 @@ def test_grid_video_play():
         con.close()
 
 
+def test_rerun_analysis():
+    """改了判定参数后重新分析（2026-09-07）：把已分析记录退回待分析。
+
+    根因：分析队列只取 status IN ('metadata','pending')，analyzed/keep/trash 都不在
+    其中。改完 YOLO 阈值直接点「启动 AI 分析」→ 0 条待分析 → 看起来像坏了。
+    """
+    section("改参数后重新分析")
+
+    from src.db import Database as _DB  # noqa: F401
+
+    d, db, bid, ids = _tmp_db(6)
+    try:
+        # 0,1 已分析未处置 / 2,3 分析失败 / 4,5 已人工处置(keep/trash)
+        for i in (0, 1):
+            db.update_analysis(ids[i], {"status": "analyzed", "retention_score": 10,
+                                        "verdict": "trash", "decision_trace": {"x": 1},
+                                        "final_score": 10, "has_person": 0})
+        for i in (2, 3):
+            db.update_analysis(ids[i], {"status": "error", "analyze_error": "解码超时"})
+        db.set_human_decision(ids[4], "keep")
+        db.set_human_decision(ids[5], "trash", trash_path=str(d / "x.mp4"),
+                              trash_tier="A")
+
+        check(db.count_resettable("undecided") == 4,
+              f"未人工处置可退回 4 条（2 已分析 + 2 失败），实际 "
+              f"{db.count_resettable('undecided')}")
+        check(db.count_resettable("failed") == 2, "仅失败项 2 条")
+        check(db.count_resettable("all") == 6, "全部 6 条")
+
+        n = db.reset_analysis("undecided")
+        check(n == 4, f"退回 4 条，实际 {n}")
+        r0 = db.get_video(ids[0])
+        check(r0["status"] == "metadata" and r0["retention_score"] is None
+              and r0["verdict"] is None and r0["decision_trace"] is None,
+              "分析结果已清空（分数/判定/依据链），状态回到 metadata")
+        check(len(db.iter_pending_analysis(limit=100)) == 4,
+              "退回后重新进入待分析队列 —— 这才是重跑生效的关键")
+        check(db.count_resettable("undecided") == 0, "幂等：再无可退回项")
+
+        # 人工处置的不受影响
+        r4, r5 = db.get_video(ids[4]), db.get_video(ids[5])
+        check(r4["human_decision"] == "keep" and r5["human_decision"] == "trash",
+              "默认范围不动人工处置决定（keep / trash 均保留）")
+        check(r5["trash_path"] is not None, "已移入回收目录的 trash_path 不被清空")
+
+        # failed 档：只重试错误项
+        check(db.reset_analysis("failed") == 0,
+              "undecided 已把 error 一并退回，failed 档此时为 0")
+
+        try:
+            db.reset_analysis("bogus")
+            check(False, "非法 scope 应抛 ValueError")
+        except ValueError:
+            check(True, "非法 scope 抛 ValueError（防止误传字符串静默全表重置）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 红线：重置只能 UPDATE 清字段，绝不能删行删表
+    import inspect
+    from src import db as dbmod
+    body = inspect.getsource(dbmod.Database.reset_analysis)
+    check(not any(w in body for w in ("DELETE", "DROP", "unlink", "rmtree")),
+          "reset_analysis 不含 DELETE/DROP/文件删除（只 UPDATE 字段）")
+
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    seg = ui_src[ui_src.index("🔄 改了判定参数？重新分析"):]
+    seg = seg[:seg.index("🔊 音频复核")]
+    check('st.button("↩ 退回待分析"' in seg, "设置页提供「退回待分析」按钮")
+    check('st.button("🔄 退回并立即重跑分析"' in seg, "提供「退回并立即重跑」一键入口")
+    check('key="reset_scope"' in seg and '"undecided"' in seg,
+          "范围单选默认 undecided（不动人工结论）")
+    check('key="reset_all_ok"' in seg, "全量退回需二次确认勾选")
+    check("db.count_resettable(" in seg, "按钮前显示各范围条数")
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -1030,6 +1105,7 @@ def main() -> int:
     test_archive()
     test_grid_audio_text()
     test_grid_video_play()
+    test_rerun_analysis()
 
     print()
     print("=" * 66)
