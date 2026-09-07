@@ -24,8 +24,12 @@ from typing import Any, Callable, Deque, Dict, Optional
 _SCAN = "scan"
 _ANALYZE = "analyze"
 _AUDIO = "audio"
+_ARCHIVE = "archive"          # L2.7 语音档案归档（纯本地复制，分钟级）
 
-KIND_NAMES = {_SCAN: "扫描元数据", _ANALYZE: "AI 分析", _AUDIO: "音频复核"}
+from .archiver import check_ready as check_archive_ready
+
+KIND_NAMES = {_SCAN: "扫描元数据", _ANALYZE: "AI 分析", _AUDIO: "音频复核",
+              _ARCHIVE: "语音档案归档"}
 
 
 class Job:
@@ -202,6 +206,20 @@ def _run_audio(job: Job, db, cfg: Dict, limit: Optional[int],
     job.processed = res.get("checked", 0) + res.get("errors", 0)
 
 
+def _run_archive(job: Job, db, cfg: Dict, limit: int = 5000) -> None:
+    """语音档案归档：把已入回收目录的有效语音复制成 wav+txt 并追加 manifest。"""
+    from .archiver import archive_pending, ArchiveError
+    problems = check_archive_ready(cfg)
+    if problems:
+        raise ArchiveError("归档未就绪：" + "；".join(problems))
+    pending = db.count_archive_pending()
+    job.total = min(pending, limit)
+    res = archive_pending(db, cfg, limit=limit, progress=_hook(job),
+                          log=job.log, stop_event=job._stop)
+    job.result = res
+    job.processed = res.get("done", 0) + res.get("skipped", 0) + res.get("failed", 0)
+
+
 def _count_pending(db) -> int:
     with db.conn() as c:
         r = c.execute("SELECT COUNT(*) FROM videos WHERE status IN ('metadata','pending') "
@@ -229,6 +247,11 @@ def start_audio_review(db, cfg, limit: Optional[int] = None,
                          lambda j: _run_audio(j, db, cfg, limit, batch_id, scope))
 
 
+def start_archive(db, cfg, limit: int = 5000) -> tuple[bool, str]:
+    """启动语音档案归档后台任务。目录不合法时返回错误信息。"""
+    return MANAGER.start(_ARCHIVE, lambda j: _run_archive(j, db, cfg, limit))
+
+
 def get_scan_job() -> Job:
     return MANAGER.get(_SCAN)
 
@@ -241,6 +264,10 @@ def get_audio_job() -> Job:
     return MANAGER.get(_AUDIO)
 
 
+def get_archive_job() -> Job:
+    return MANAGER.get(_ARCHIVE)
+
+
 def any_running() -> bool:
     return (get_scan_job().running or get_analyze_job().running
-            or get_audio_job().running)
+            or get_audio_job().running or get_archive_job().running)

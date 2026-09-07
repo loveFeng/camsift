@@ -157,6 +157,11 @@ AUDIO_COLUMNS: Dict[str, str] = {
     "audio_checked_at": "TEXT",
 }
 
+# L2.7 语音档案列：归档时间戳（幂等标记，配合 manifest.jsonl 双保险）
+ARCHIVE_COLUMNS: Dict[str, str] = {
+    "archived_at": "TEXT",
+}
+
 
 def _scope_sql(scope: str | None) -> str:
     """复核范围 → verdict 过滤 SQL 片段。默认 all（待清理 + 需人工确认）。"""
@@ -186,9 +191,9 @@ class Database:
             self._migrate(c)
 
     def _migrate(self, c) -> None:
-        """老库补齐新增列（音频复核字段）。已存在则跳过，幂等安全。"""
+        """老库补齐新增列（音频复核 / 归档字段）。已存在则跳过，幂等安全。"""
         existing = {r[1] for r in c.execute("PRAGMA table_info(videos)")}
-        for col, decl in AUDIO_COLUMNS.items():
+        for col, decl in {**AUDIO_COLUMNS, **ARCHIVE_COLUMNS}.items():
             if col not in existing:
                 c.execute(f"ALTER TABLE videos ADD COLUMN {col} {decl}")
 
@@ -527,6 +532,38 @@ class Database:
         args += [limit, int(offset or 0)]
         with self.conn() as c:
             return c.execute(sql, args).fetchall()
+
+    # ------------------------------------------------------------ 语音档案
+    def archive_queue(self, limit: int = 5000) -> List[sqlite3.Row]:
+        """待归档队列：已移入回收目录 + 确认为有效语音 + 尚未归档。
+
+        谓词与 list_moved 一致（human_decision='trash' 且 trash_path 非空），
+        撤销移动后 human_decision 变 keep，自动退出队列。
+        """
+        sql = ("SELECT * FROM videos WHERE human_decision='trash' "
+               "AND trash_path IS NOT NULL AND speech_present=1 "
+               "AND archived_at IS NULL ORDER BY id ASC LIMIT ?")
+        with self.conn() as c:
+            return c.execute(sql, (int(limit or 5000),)).fetchall()
+
+    def count_archive_pending(self) -> int:
+        """待归档条数（已入回收目录的有效语音，未归档）。"""
+        sql = ("SELECT COUNT(*) FROM videos WHERE human_decision='trash' "
+               "AND trash_path IS NOT NULL AND speech_present=1 "
+               "AND archived_at IS NULL")
+        with self.conn() as c:
+            return c.execute(sql).fetchone()[0]
+
+    def count_archived(self) -> int:
+        """已归档条数。"""
+        with self.conn() as c:
+            return c.execute(
+                "SELECT COUNT(*) FROM videos WHERE archived_at IS NOT NULL").fetchone()[0]
+
+    def mark_archived(self, video_id: int, ts: str) -> None:
+        """标记已归档（幂等：重复标记无副作用，值被覆盖为最新时间）。"""
+        with self.conn() as c:
+            c.execute("UPDATE videos SET archived_at=? WHERE id=?", (ts, video_id))
 
     def list_moved(self, batch_id: int | None = None, limit: int = 5000) -> List[sqlite3.Row]:
         """已移入回收目录、可撤销的文件。"""

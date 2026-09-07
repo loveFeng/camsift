@@ -747,6 +747,132 @@ def test_audio_review():
           "dsp_filter 置空：跳过降噪级，直接整段 ASR 兜底")
 
 
+# --------------------------------------------------------------------------- 12
+def test_archive():
+    """L2.7 语音档案归档：红线 / 谓词 / 配对 / 幂等 / 撤销不回收。"""
+    section("语音档案归档")
+    from src import archiver as A
+
+    # 1) 盘符红线：归档目录绝不能在源盘或回收目录所在盘（那里会被手动清空）
+    p = A.check_ready({"trash_root": r"G:\need-del", "source_root": r"G:\change\2015",
+                       "archive": {"dir": r"G:\audio-archive"}})
+    check(len(p) == 2, f"红线：归档目录与源盘/回收目录同盘 → 拒绝（{len(p)} 条）")
+    check(A.check_ready({"trash_root": r"G:\need-del", "source_root": r"G:\change\2015",
+                         "archive": {"dir": r"E:\audio-archive"}}) == [],
+          "异盘归档目录 → 检查通过")
+    check(A.check_ready({"trash_root": "", "source_root": "",
+                         "archive": {"dir": r"E:\audio-archive"}}) == [],
+          "未配置源/回收目录时不误报")
+
+    d, db, bid, ids = _tmp_db(4)
+    try:
+        # 造 4 种情况：
+        # v0 已入回收目录 + 有效语音 + 缓存 wav 在      → 归档成功
+        # v1 有效语音但未移动（无 trash_path）          → 不入队
+        # v2 已移动但无人声                              → 不入队
+        # v3 已移动 + 有效语音但缓存 wav 缺失            → 入队后跳过
+        def _prep(vid, moved: bool, speech: bool):
+            db.upsert_video_meta(db.get_video(vid)["path"], {
+                "filename": db.get_video(vid)["filename"], "rel_dir": "", "year": "2024",
+                "size_bytes": 1, "mtime": 0, "duration_sec": 60,
+                "width": 1920, "height": 1080, "video_codec": "hevc",
+                "has_audio": 1, "audio_energy": None, "bitrate_kbps": 1000,
+                "meta_ok": 1, "meta_error": None})
+            _mark_analyzed(db, vid, "trash", 5.0)
+            db.update_audio_review(vid, {
+                "speech_present": 1 if speech else 0, "speech_ratio": 0.3 if speech else 0.0,
+                "speech_segments": "[[1.0,3.0]]", "transcript_text": "测试转写内容" if speech else "",
+                "transcript_segments": "[]", "audio_checked": 1})
+            if moved:
+                db.set_human_decision(vid, "trash",
+                                      trash_path=str(d / "need-del" / f"v{vid}.mp4"),
+                                      trash_tier="A")
+
+        _prep(ids[0], True, True)
+        _prep(ids[1], False, True)
+        _prep(ids[2], True, False)
+        _prep(ids[3], True, True)
+
+        # 缓存 wav 只给 v0 / v1 造
+        aud = d / "audio"
+        aud.mkdir(exist_ok=True)
+        (aud / f"{ids[0]}.wav").write_bytes(b"RIFF" + b"\x00" * 100)
+        (aud / f"{ids[1]}.wav").write_bytes(b"RIFF" + b"\x00" * 100)
+
+        q = {r["id"] for r in db.archive_queue()}
+        check(q == {ids[0], ids[3]},
+              f"队列谓词：已入回收目录∧有效语音∧未归档（{sorted(q)}）")
+        check(db.count_archive_pending() == 2 and db.count_archived() == 0,
+              "计数：待归档 2 / 已归档 0")
+
+        cfg = {"work_dir": str(d), "trash_root": "", "source_root": "",
+               "archive": {"dir": str(d / "arch")}}
+        res = A.archive_pending(db, cfg, limit=100)
+        check(res["done"] == 1 and res["skipped"] == 1 and res["failed"] == 0,
+              f"归档结果：成功 {res['done']} / 缓存缺失跳过 {res['skipped']} / 失败 0")
+
+        # 文件名 wav+txt 配对，txt 内容 = 数据库转写
+        wav = Path(d) / "arch" / "2024" / f"{db.get_video(ids[0])['filename'][:-4]}.wav"
+        txt = wav.with_suffix(".txt")
+        check(wav.exists() and txt.exists(), "归档产物：wav + 同名 txt 配对存在")
+        check(txt.read_text(encoding="utf-8") == "测试转写内容",
+              "txt 内容与数据库 transcript_text 一致")
+
+        mf = Path(d) / "arch" / "manifest.jsonl"
+        lines = mf.read_text(encoding="utf-8").strip().splitlines()
+        rec = json.loads(lines[0])
+        check(len(lines) == 1 and rec["id"] == ids[0]
+              and rec["transcript"] == "测试转写内容"
+              and rec["trash_path"].endswith(".mp4"),
+              "manifest.jsonl：一行一条 JSON，含 id/转写/回收路径")
+
+        # 幂等：再跑一次不新增
+        res2 = A.archive_pending(db, cfg, limit=100)
+        lines2 = mf.read_text(encoding="utf-8").strip().splitlines()
+        check(res2["done"] == 0 and len(lines2) == 1,
+              "幂等：重复执行不重复归档、manifest 不追加")
+        check(db.count_archived() == 1, "已归档计数 = 1（archived_at 标记）")
+
+        # 撤销移动 → 退出队列，但已归档文件保留（档案独立，宁存勿删）
+        db.set_human_decision(ids[0], "keep")
+        check(db.count_archive_pending() == 1
+              and ids[0] not in {r["id"] for r in db.archive_queue()},
+              "撤销移动后退出归档队列")
+        check(wav.exists() and txt.exists(), "撤销移动不回收已生成的档案文件")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 3) 迁移幂等：archived_at 列存在
+    _d2, db2, _, _ = _tmp_db(1)
+    try:
+        cols = {r["name"] for r in _pcol(db2)}
+        check("archived_at" in cols, "DB 迁移：videos 已补齐 archived_at 列")
+    finally:
+        shutil.rmtree(_d2, ignore_errors=True)
+
+    # 4) UI / jobs 接线（源码级检查，防改后端忘接线）
+    ui_src = (Path(__file__).resolve().parent.parent / "src" / "ui.py").read_text(encoding="utf-8")
+    jobs_src = (Path(__file__).resolve().parent.parent / "src" / "jobs.py").read_text(encoding="utf-8")
+    check("立即归档有效语音" in ui_src and "count_archive_pending" in ui_src,
+          "UI：设置页已挂载语音档案卡与归档计数")
+    check('jobsmod.get_archive_job()' in ui_src, "UI：进度页接入归档任务面板")
+    check('_ARCHIVE = "archive"' in jobs_src and "start_archive" in jobs_src,
+          "jobs：归档任务类型已注册")
+
+
+def _pcol(db):
+    """取 videos 列名集合（兼容 Database / sqlite3 连接两种形态）。"""
+    conn = getattr(db, "db_path", None)
+    import sqlite3
+    c = sqlite3.connect(conn) if conn else db
+    try:
+        cur = c.execute("PRAGMA table_info(videos)")
+        return [{"name": r[1]} for r in cur]
+    finally:
+        if conn:
+            c.close()
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -760,6 +886,7 @@ def main() -> int:
     test_config_resilience()
     test_grid_select_all()
     test_audio_review()
+    test_archive()
 
     print()
     print("=" * 66)

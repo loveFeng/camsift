@@ -692,6 +692,9 @@ def tab_progress(db, cfg):
         job_panel(jobsmod.get_analyze_job(), "🤖 AI 分析", "analyze")
     with j3:
         job_panel(jobsmod.get_audio_job(), "🔊 音频复核", "audio")
+    _aj = jobsmod.get_archive_job()
+    if _aj.status != "idle":      # 只在归档跑过/在跑时才占版面
+        job_panel(_aj, "📦 语音档案归档", "archive")
 
     st.divider()
     st.markdown("##### 批次进度")
@@ -991,6 +994,45 @@ def tab_settings(db, cfg):
         f"当前待复核：**待清理 {n_trash}** 段 + **需人工确认 {n_review}** 段"
         f"（均有音轨、未复核、未处置）。当前范围：**{scope_txt}** —— 启动后自动跳过"
         "已复核/无音轨片段，可随时停止，进度写入数据库不丢。")
+
+    st.divider()
+    # —— L2.7 语音档案：删除视频前把"有效语音"的音频 + 转写永久收藏 ——
+    st.markdown("##### 📦 语音档案")
+    st.caption(
+        "视频画面没有保存价值，但里面的人声以后可能有用（ASR 训练 / 资料检索）。"
+        "按一次下面的按钮，把所有**已移入回收目录且确认为有效语音**的音频"
+        "复制成 `wav + 同名转写 txt`，并追加到 `manifest.jsonl`。"
+        "**只复制、不移动不删除**，可反复按（已归档的自动跳过）。")
+
+    from src import archiver as armod          # noqa: E402 局部导入，避免拖慢首屏
+    a_dir = st.text_input(
+        "语音档案保存目录", str(cfg.get("archive", {}).get("dir", "")),
+        key="archive_dir",
+        help="⚠️ 绝不能设在源盘或回收目录所在的盘（那里会被手动清空）")
+    if a_dir != str(cfg.get("archive", {}).get("dir", "")):
+        cfg["archive"]["dir"] = a_dir          # 即改即用（真正落盘在按保存/归档时）
+    if st.button("💾 保存归档目录", key="save_archive_dir"):
+        cfgmod.save_config(cfg)
+        st.success(f"已保存语音档案目录：`{a_dir}`")
+
+    n_pending = db.count_archive_pending()
+    n_done = db.count_archived()
+    st.caption(f"待归档：**{n_pending}** 段（已入回收目录 + 有效语音）"
+               f"　已归档：**{n_done}** 段")
+
+    _arch_problems = armod.check_ready(cfg)
+    for _p in _arch_problems:
+        st.error(f"⚠️ {_p}")
+    if st.button("📦 立即归档有效语音", use_container_width=True,
+                 key="start_archive",
+                 disabled=jobsmod.get_archive_job().running or n_pending == 0):
+        if _arch_problems:
+            st.error("归档目录不合法，请先修正后再执行。")
+        else:
+            cfgmod.save_config(cfg)
+            ok, msg = jobsmod.start_archive(db, cfg, limit=5000)
+            st.success(msg) if ok else st.warning(msg)
+            st.rerun()
 
     st.divider()
     st.markdown("##### 导出清单")
