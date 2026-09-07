@@ -138,9 +138,15 @@ def render_reasons(row):
     score = trace.get("score", row["retention_score"])
     verdict = trace.get("verdict", row["verdict"])
 
+    if score is None and verdict is None:
+        # 重新分析退回后，缓存队列里的旧 id 会取到已清空结果的记录
+        st.warning("该片段的分析结果已被重置（可能刚执行了「重新分析」），"
+                   "等待 AI 分析跑完后会在此显示新的判定依据。")
+        return trace
+
     c1, c2 = st.columns([1, 3])
     with c1:
-        st.metric("保留价值分", f"{score:g}")
+        st.metric("保留价值分", f"{score:g}" if score is not None else "—")
         st.markdown(f"**判定：{VERDICT_TEXT.get(verdict, verdict)}**")
     with c2:
         st.info(trace.get("summary", "（无判定摘要）"))
@@ -460,6 +466,13 @@ def tab_review(db, cfg):
     if not row:
         st.error("记录不存在")
         return
+    if row["verdict"] not in ("trash", "review"):
+        # 队列 id 缓存已过期：该条被重新分析退回 / 已被处置，不再属于审核范围。
+        # 重新加载当前页 —— _queue_load 按 review_queue 谓词查库，新页不会再失效，
+        # 因此这里 rerun 一次即可收敛，不会循环。
+        st.session_state["_q_reload"] = True
+        st.toast("队列已刷新（有片段被重新分析或已处置）", icon="🔄")
+        st.rerun()
 
     left, right = st.columns([3, 2])
     with left:
@@ -715,7 +728,9 @@ def tab_grid(db, cfg):
                     st.image(str(tp), use_container_width=True)
                 score = row["final_score"] if row["final_score"] is not None else row["retention_score"]
                 tier = mover.decide_tier(row, cfg)
-                st.caption(f"`{score:g}分` {tier}档　{row['filename'][:24]}")
+                st.caption(f"`{score:g}分` {tier}档　{row['filename'][:24]}"
+                           if score is not None else
+                           f"`—分` {tier}档　{row['filename'][:24]}")
                 if st.session_state.grid_show_audio:
                     ah = _grid_audio_html(row)
                     if ah:

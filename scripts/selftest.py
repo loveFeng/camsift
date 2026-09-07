@@ -1089,6 +1089,54 @@ def test_rerun_analysis():
     check("db.count_resettable(" in seg, "按钮前显示各范围条数")
 
 
+def test_review_queue_selfheal():
+    """审核队列对"已重置记录"的自愈（2026-09-07 真实崩溃修复）。
+
+    崩溃链路：审核队列 id 缓存在 session_state → 用户「退回并立即重跑分析」把
+    那批记录的 verdict/score 清空 → 页面 rerun 用旧 id 取行 → f"{None:g}" TypeError。
+    修复：渲染前校验 verdict 仍在审核范围，失效则整页重载（自愈收敛，不会循环）；
+    render_reasons 对 None 分数容错。
+    """
+    section("审核队列 过期自愈")
+
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    seg = ui_src[ui_src.index("def render_reasons") + 4:]
+    seg = seg[:seg.index("def ")]
+    check('if score is None and verdict is None' in seg,
+          "render_reasons：分数与判定均为空时给出重置提示而非崩溃")
+    check('f"{score:g}" if score is not None else "—"' in seg,
+          "render_reasons：None 分数显示 —（指标不格式化 None）")
+
+    seg2 = ui_src[ui_src.index("def tab_review"):]
+    seg2 = seg2[:seg2.index("def tab_", 5)] if "def tab_" in seg2[5:] else seg2
+    check('row["verdict"] not in ("trash", "review")' in seg2,
+          "渲染前校验队列条目仍在审核范围")
+    check('"_q_reload"' in seg2 and "st.rerun()" in seg2,
+          "失效条目触发整页重载（自愈）")
+
+    # 行为级：把一条已被重置（verdict IS NULL）的真实 id 塞进缓存队列，页面必须不崩
+    from streamlit.testing.v1 import AppTest
+    cfg = load_config()
+    con = sqlite3.connect(cfg["runtime"]["sqlite_path"])
+    con.row_factory = sqlite3.Row
+    dead = con.execute(
+        "SELECT id FROM videos WHERE verdict IS NULL LIMIT 1").fetchone()
+    con.close()
+    if dead is None:
+        check(True, "（库中无已重置记录，跳过行为级复现）")
+        return
+    at = AppTest.from_file(str(Path("src/ui.py").resolve()), default_timeout=240)
+    at.session_state["queue"] = [dead["id"]]
+    at.session_state["q_page"] = 0
+    at.session_state["idx"] = 0
+    at.run()
+    check(not at.exception,
+          f"预置死 id {dead['id']} 后页面无异常（原崩溃场景已修复）")
+    q = list(at.session_state["queue"])
+    check(dead["id"] not in q and len(q) > 0,
+          f"队列已自愈刷新（{len(q)} 条有效 id，死 id 不再出现）")
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -1106,6 +1154,7 @@ def main() -> int:
     test_grid_audio_text()
     test_grid_video_play()
     test_rerun_analysis()
+    test_review_queue_selfheal()
 
     print()
     print("=" * 66)
