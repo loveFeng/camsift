@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import sqlite3
@@ -32,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import feedback as fb  # noqa: E402
 from src import mover  # noqa: E402
 from src import config as cfgmod  # noqa: E402
-from src.config import load_config, save_config, _read_json, detect_sync_risk, LAST_NOTICE  # noqa: E402
+from src.config import load_config, save_config, _read_json, detect_sync_risk  # noqa: E402
 from src.db import Database  # noqa: E402
 
 PASS, FAIL = "  [OK]  ", "  [FAIL]"
@@ -68,8 +67,7 @@ def blank_row(**kw):
         "id": 1, "path": "x.mp4", "filename": "x.mp4",
         "raw_detections": "[]", "frame_stats": "{}", "decision_trace": "{}",
         "retention_score": 0, "verdict": "trash", "motion_area_ratio": 0.0,
-        "vlm_agree": None, "vlm_has_person": None, "vlm_has_vehicle": None,
-        "vlm_evidence": None, "year": "2024", "rel_dir": "", "batch_id": 1,
+        "year": "2024", "rel_dir": "", "batch_id": 1,
     }
     base.update(kw)
     return FakeRow(base)
@@ -144,21 +142,12 @@ def test_misjudgment(cfg):
 # --------------------------------------------------------------------------- 2
 def test_tier(cfg):
     section("回收档位分档")
-    cfg_off = json.loads(json.dumps(cfg))
-    cfg_off["vlm"]["enabled"] = False
-
     row_a = blank_row(retention_score=0, decision_trace=json.dumps({"near_miss": {}}))
-    check(mover.decide_tier(row_a, cfg_off) == "A", "无目标且分数为 0 → A 档（可批量删除）")
+    check(mover.decide_tier(row_a, cfg) == "A", "无目标且分数为 0 → A 档（可批量删除）")
 
     row_b = blank_row(retention_score=0,
                       decision_trace=json.dumps({"near_miss": {"person": 0.38}}))
-    check(mover.decide_tier(row_b, cfg_off) == "B", "存在未达阈值疑似目标 → B 档（建议抽查）")
-
-    cfg_on = json.loads(json.dumps(cfg))
-    cfg_on["vlm"]["enabled"] = True
-    row_c = blank_row(retention_score=0, decision_trace=json.dumps({"near_miss": {}}),
-                      vlm_agree=0, vlm_has_person=1)
-    check(mover.decide_tier(row_c, cfg_on) == "B", "两级模型分歧 → B 档")
+    check(mover.decide_tier(row_b, cfg) == "B", "存在未达阈值疑似目标 → B 档（建议抽查）")
 
 
 # --------------------------------------------------------------------------- 3
@@ -382,7 +371,7 @@ def test_config_resilience():
         # —— D2. 主文件干脆被同步软件删了 → 当作全新安装，用默认值
         cfg_path.unlink()
         cfg = load_config(cfg_path)
-        check(cfg.get("vlm", {}).get("model") == "qwen3-vl:4b",
+        check(cfg.get("scoring", {}).get("person_weight") == 50,
               "主文件不存在 → 按全新安装处理，返回默认配置")
 
         # —— E. 全部坏掉：主文件损坏 + .bak 损坏 + 无 Conflict → 给默认配置 + 提示重填
@@ -391,7 +380,7 @@ def test_config_resilience():
         for f in d.glob("*Conflict*.json"):
             f.unlink()  # 删掉所有 Conflict 副本
         cfg = load_config(cfg_path)
-        check(isinstance(cfg, dict) and cfg.get("vlm", {}).get("model") == "qwen3-vl:4b",
+        check(isinstance(cfg, dict) and cfg.get("scoring", {}).get("person_weight") == 50,
               "主+bak+Conflict 全坏 → 返回默认配置")
         check("重置为默认" in cfgmod.LAST_NOTICE,
               f"明确提示用户需要重填：{cfgmod.LAST_NOTICE[:50]}")
@@ -400,14 +389,14 @@ def test_config_resilience():
         for ext in (".json", ".bak"):
             for f in d.glob(f"*{ext}"):
                 f.unlink()
-        cfg = {"source_root": "G:\\camera\\2024", "vlm": {"enabled": True}}
+        cfg = {"source_root": "G:\\camera\\2024", "scoring": {"person_weight": 99}}
         save_config(cfg, cfg_path)
         # 不应残留任何 .tmp-* 临时文件
         tmps = list(d.glob("*.tmp-*"))
         check(not tmps, f"无残留临时文件（{len(tmps)} 个）")
         # .bak 必须是"最后一次成功保存"的副本，不是上一次
         bak_content = json.loads(bak_path.read_text(encoding="utf-8"))
-        check(bak_content["vlm"]["enabled"] is True,
+        check(bak_content["scoring"]["person_weight"] == 99,
               ".bak 保存的是最新版本，不是上一版（修复过此 bug）")
 
         # —— G. 同步风险识别
@@ -556,7 +545,6 @@ def test_audio_review():
               "复核结果正确落库")
 
         # 5) review_one 的引擎无关分支：无音轨 → 跳过；文件缺失 → 跳过
-        import sqlite3
         cfg = {"work_dir": str(d), "audio": {"engine": "funasr"},
                "llm": {"enabled": False}, "runtime": {}}
         ar = AudioReviewer(cfg)
@@ -641,9 +629,10 @@ def test_audio_review():
           and _scope_sql("review") == "= 'review'"
           and _scope_sql(None) == "IN ('trash','review')",
           "范围 → verdict SQL：all 含两类，trash/review 单档，非法回落 all")
-    d2, db2, _, ids2 = _tmp_db(4)   # v0,v1 trash+review 待复核各1
+    d2, db2, _, ids2 = _tmp_db(6)   # v0,v1 待复核各1；v2 已放行未复核；v3 已放行已复核
     try:
-        for v, verdict in ((ids2[0], "trash"), (ids2[1], "review")):
+        for v, verdict in ((ids2[0], "trash"), (ids2[1], "review"),
+                           (ids2[2], "trash"), (ids2[3], "trash")):
             db2.upsert_video_meta(db2.get_video(v)["path"], {
                 "filename": db2.get_video(v)["filename"], "rel_dir": "", "year": "2024",
                 "size_bytes": 1, "mtime": 0, "duration_sec": 60,
@@ -651,15 +640,40 @@ def test_audio_review():
                 "has_audio": 1, "audio_energy": None, "bitrate_kbps": 1000,
                 "meta_ok": 1, "meta_error": None})
             _mark_analyzed(db2, v, verdict, 5.0)
-        check(db2.count_audio_pending() == 2 and db2.count_audio_pending(scope="all") == 2,
+        check(db2.count_audio_pending() == 4 and db2.count_audio_pending(scope="all") == 4,
               "范围 all：trash+review 均计入待复核（默认全量覆盖）")
-        check(db2.count_audio_pending(scope="trash") == 1
+        check(db2.count_audio_pending(scope="trash") == 3
               and db2.count_audio_pending(scope="review") == 1,
               "范围拆分：trash/review 各自计数正确")
         q_all = {x["id"] for x in db2.audio_review_queue()}
         q_r = {x["id"] for x in db2.audio_review_queue(scope="review")}
-        check(q_all == {ids2[0], ids2[1]} and q_r == {ids2[1]},
-              "队列过滤：all 含两类；review 只取需人工确认档")
+        check(q_all == set(ids2[:4]) and q_r == {ids2[1]},
+              f"队列过滤：all 含两类（{sorted(q_all)}）；review 只取需人工确认档")
+
+        # 9) 队列放宽（ADR 0003）：已放行/已自动处置的片段仍能补复核 + 归档
+        moved = d2 / "need-del"
+        moved.mkdir(exist_ok=True)
+        (moved / "v2.mp4").write_bytes(b"x")
+        db2.set_human_decision(ids2[2], "trash",
+                               trash_path=str(moved / "v2.mp4"), trash_tier="A")
+        db2.update_audio_review(ids2[3], {"audio_checked": 1, "speech_present": 0})
+        check(db2.count_audio_pending() == 3,
+              "已放行但未复核的片段仍计入待复核（队列放宽后不再漏画外音）")
+        check(ids2[2] in {x["id"] for x in db2.audio_review_queue()},
+              "audio_review_queue 收录已移入回收目录的未复核片段")
+        check(ids2[3] not in {x["id"] for x in db2.audio_review_queue()},
+              "复核过的片段出队（无论是否已移入回收）")
+        check(db2.count_audio_pending(scope="trash") == 2,
+              "scope=trash：已放行的 review 档不被 verdict 挡掉（scope 只约束未处置半边）")
+
+        # 10) 复核可按回收路径取源（源失效 + trash_path 在 → 不再误判源文件不存在）
+        ar2 = AudioReviewer({"work_dir": str(d2), "audio": {"engine": "funasr"},
+                             "llm": {"enabled": False}, "runtime": {}})
+        with db2.conn() as c:      # has_audio=0 → 取到源后走"无音轨"分支，不触发引擎
+            c.execute("UPDATE videos SET has_audio=0 WHERE id=?", (ids2[2],))
+        r2 = ar2.review_one(db2, db2.get_video(ids2[2]))
+        check(r2.get("skipped") == "无音轨",
+              "review_one：源路径失效时回落到回收路径（不再误判源文件不存在）")
     finally:
         shutil.rmtree(d2, ignore_errors=True)
 
@@ -750,28 +764,45 @@ def test_audio_review():
 
 # --------------------------------------------------------------------------- 12
 def test_archive():
-    """L2.7 语音档案归档：红线 / 谓词 / 配对 / 幂等 / 撤销不回收。"""
+    """L2.7 语音档案归档：同盘提示 / 谓词 / 配对 / 幂等 / 撤销不回收。"""
     section("语音档案归档")
     from src import archiver as A
 
-    # 1) 盘符红线：归档目录绝不能在源盘或回收目录所在盘（那里会被手动清空）
-    p = A.check_ready({"trash_root": r"G:\need-del", "source_root": r"G:\change\2015",
-                       "archive": {"dir": r"G:\audio-archive"}})
-    check(len(p) == 2, f"红线：归档目录与源盘/回收目录同盘 → 拒绝（{len(p)} 条）")
+    # 1) 同盘只提示不禁止：删除是手动操作，用户自己可控，决定权留给人
+    same = {"trash_root": r"G:\need-del", "source_root": r"G:\change\2015",
+            "archive": {"dir": r"G:\audio-archive"}}
+    p, w = A.check_ready(same), A.check_warnings(same)
+    check(p == [], f"同盘不再是硬错误，允许执行（硬错误 {len(p)} 条）")
+    check(len(w) == 2, f"同盘给出 2 条软提示（{len(w)} 条）")
     check(A.check_ready({"trash_root": r"G:\need-del", "source_root": r"G:\change\2015",
                          "archive": {"dir": r"E:\audio-archive"}}) == [],
           "异盘归档目录 → 检查通过")
+    check(A.check_warnings({"trash_root": r"G:\need-del", "source_root": r"G:\change\2015",
+                            "archive": {"dir": r"E:\audio-archive"}}) == [],
+          "异盘归档目录 → 无提示")
     check(A.check_ready({"trash_root": "", "source_root": "",
                          "archive": {"dir": r"E:\audio-archive"}}) == [],
           "未配置源/回收目录时不误报")
+    # 真正的硬错误仍然拦截（含 G:\ 这种盘符根，不能只比 "/"）
+    check(len(A.check_ready({"trash_root": "", "source_root": "",
+                             "archive": {"dir": "G:\\"}})) == 1,
+          "目录为盘符根目录 G:\\ → 硬错误拦截")
+    check(len(A.check_ready({"trash_root": "", "source_root": "",
+                             "archive": {"dir": "/"}})) == 1,
+          "目录为 / → 硬错误拦截")
+    check(A.is_drive_root("G:\\") and A.is_drive_root("/") and A.is_drive_root(""),
+          "is_drive_root 识别 G:\\ / 空")
+    check(not A.is_drive_root(r"G:\audio-archive") and not A.is_drive_root("audio"),
+          "is_drive_root 不误伤普通目录")
 
     d, db, bid, ids = _tmp_db(4)
     try:
         # 造 4 种情况：
-        # v0 已入回收目录 + 有效语音 + 缓存 wav 在      → 归档成功
-        # v1 有效语音但未移动（无 trash_path）          → 不入队
-        # v2 已移动但无人声                              → 不入队
-        # v3 已移动 + 有效语音但缓存 wav 缺失            → 入队后跳过
+        # v0 已入回收目录 + 有效语音 + 缓存 wav 在   → 归档成功
+        # v1 有效语音但未移动（无 trash_path）       → 新谓词下仍是处置候选，
+        #                                             可归档（画外音盲区兜底，ADR 0001）
+        # v2 已移动但无人声                          → 不入队
+        # v3 已移动 + 有效语音但缓存 wav 缺失        → 入队后跳过
         def _prep(vid, moved: bool, speech: bool):
             db.upsert_video_meta(db.get_video(vid)["path"], {
                 "filename": db.get_video(vid)["filename"], "rel_dir": "", "year": "2024",
@@ -801,16 +832,16 @@ def test_archive():
         (aud / f"{ids[1]}.wav").write_bytes(b"RIFF" + b"\x00" * 100)
 
         q = {r["id"] for r in db.archive_queue()}
-        check(q == {ids[0], ids[3]},
-              f"队列谓词：已入回收目录∧有效语音∧未归档（{sorted(q)}）")
-        check(db.count_archive_pending() == 2 and db.count_archived() == 0,
-              "计数：待归档 2 / 已归档 0")
+        check(q == {ids[0], ids[1], ids[3]},
+              f"队列谓词：已入回收∨未处置判删候选，∧有效语音∧未归档（{sorted(q)}）")
+        check(db.count_archive_pending() == 3 and db.count_archived() == 0,
+              "计数：待归档 3 / 已归档 0（含未移入回收的 review 类候选）")
 
         cfg = {"work_dir": str(d), "trash_root": "", "source_root": "",
                "archive": {"dir": str(d / "arch")}}
         res = A.archive_pending(db, cfg, limit=100)
-        check(res["done"] == 1 and res["skipped"] == 1 and res["failed"] == 0,
-              f"归档结果：成功 {res['done']} / 缓存缺失跳过 {res['skipped']} / 失败 0")
+        check(res["done"] == 2 and res["skipped"] == 1 and res["failed"] == 0,
+              f"归档结果：成功 {res['done']}（v0+v1）/ 缓存缺失跳过 {res['skipped']} / 失败 0")
 
         # 文件名 wav+txt 配对，txt 内容 = 数据库转写
         wav = Path(d) / "arch" / "2024" / f"{db.get_video(ids[0])['filename'][:-4]}.wav"
@@ -822,19 +853,24 @@ def test_archive():
         mf = Path(d) / "arch" / "manifest.jsonl"
         lines = mf.read_text(encoding="utf-8").strip().splitlines()
         rec = json.loads(lines[0])
-        check(len(lines) == 1 and rec["id"] == ids[0]
+        check(len(lines) == 2 and rec["id"] == ids[0]
               and rec["transcript"] == "测试转写内容"
               and rec["trash_path"].endswith(".mp4"),
-              "manifest.jsonl：一行一条 JSON，含 id/转写/回收路径")
+              "manifest.jsonl：v0 一行含 id/转写/回收路径（共 2 行）")
+        check(json.loads(lines[1])["id"] == ids[1]
+              and json.loads(lines[1])["trash_path"] is None,
+              "manifest.jsonl：v1（未移动）也已归档，trash_path 为空（数据源是缓存 wav）")
+        check((Path(d) / "arch" / "2024" / "v1.wav").exists(),
+              "归档产物：未移入回收的候选同样产出 wav")
 
         # 幂等：再跑一次不新增
         res2 = A.archive_pending(db, cfg, limit=100)
         lines2 = mf.read_text(encoding="utf-8").strip().splitlines()
-        check(res2["done"] == 0 and len(lines2) == 1,
+        check(res2["done"] == 0 and len(lines2) == 2,
               "幂等：重复执行不重复归档、manifest 不追加")
-        check(db.count_archived() == 1, "已归档计数 = 1（archived_at 标记）")
+        check(db.count_archived() == 2, "已归档计数 = 2（v0+v1，archived_at 标记）")
 
-        # 撤销移动 → 退出队列，但已归档文件保留（档案独立，宁存勿删）
+        # 撤销移动 → 退出处置候选，但已归档文件保留（档案独立，宁存勿删）
         db.set_human_decision(ids[0], "keep")
         check(db.count_archive_pending() == 1
               and ids[0] not in {r["id"] for r in db.archive_queue()},
@@ -890,9 +926,11 @@ def test_grid_audio_text():
           "格子内渲染音频摘要行（HTML 片段）")
     check('st.checkbox("🎧 显示音频转写", key="grid_show_audio")' in seg,
           "提供「显示音频转写」开关（默认开）")
-    check("st.checkbox(\"仅看检出人声\"" in seg
-          and "speech_only=st.session_state.grid_speech_only" in seg,
-          "提供「仅看检出人声」筛选并透传 SQL")
+    check('st.checkbox("仅看检出人声", key="grid_speech_only"' in seg
+          and "def _grid_filters" in ui_src and '"speech_only"] = True' in ui_src,
+          "提供「仅看检出人声」筛选，并入统一筛选字典")
+    check("db.count_review_queue(**fil)" in seg and "**fil)" in seg,
+          "筛选同时打进计数与分页查询（同一口径，防「显示 300 条、翻页却空」）")
     check("st.markdown(_GRID_AUDIO_CSS" in seg, "注入格子音频摘要样式")
 
     from src.ui import _grid_audio_html
@@ -1022,8 +1060,6 @@ def test_rerun_analysis():
     """
     section("改参数后重新分析")
 
-    from src.db import Database as _DB  # noqa: F401
-
     d, db, bid, ids = _tmp_db(6)
     try:
         # 0,1 已分析未处置 / 2,3 分析失败 / 4,5 已人工处置(keep/trash)
@@ -1137,6 +1173,786 @@ def test_review_queue_selfheal():
           f"队列已自愈刷新（{len(q)} 条有效 id，死 id 不再出现）")
 
 
+def test_review_jump_nav():
+    """审核台 / 批量浏览的「跳转 + 筛选」（ADR 0002 配套改动）回归。
+
+    要守住三件事：
+      1. 队列、计数、跳转定位共用同一组谓词 —— 任何一处单独拼 SQL 都会出现
+         「计数说 300 条、翻到第 2 页却空」（count_audio_pending 就这样错过一次）；
+      2. 「跳到分数 ≥X」等价于「数出低于 X 的条数」，不是 UI 自己扫队列；
+      3. 换筛选条件后必须从第一条重载，越界跳转要被夹住而不是崩。
+    """
+    section("审核台 / 批量浏览：跳转与筛选")
+
+    # ---------- A. db 层：计数与队列必须逐字同口径 ----------
+    d, db, bid, ids = _tmp_db(8)
+    try:
+        for i, vid in enumerate(ids):
+            db.update_analysis(vid, {"status": "analyzed", "retention_score": i * 5,
+                                     "final_score": i * 5, "verdict": "trash",
+                                     "has_person": 1 if i >= 6 else 0,
+                                     "decision_trace": {}})
+        for f in ({}, {"person_only": True}, {"min_score": 15},
+                  {"min_score": 15, "person_only": True}):
+            n = db.count_review_queue(**f)
+            rows = db.review_queue(limit=999, **f)
+            check(n == len(rows), f"计数与队列同口径 {f or '（无筛选）'}：{n} 条")
+        check(db.count_review_queue(person_only=True) == 2
+              and all(r["has_person"] for r in db.review_queue(limit=99, person_only=True)),
+              "仅看检出人物：只回 has_person=1 的片段")
+        for x in (0, 12, 15, 35, 100):
+            exp = len([r for r in db.review_queue(limit=999)
+                       if (r["final_score"] or 0) < x])
+            check(db.count_review_below(x) == exp,
+                  f"按分数定位的口径 x={x} → 位置 {db.count_review_below(x)}")
+        check(db.count_review_below(100) == 8,
+              "跳到分数 ≥100（无人达标）指向队列之后，由跳转逻辑夹回末尾")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ---------- B. 行为层：按需只加载目标页，越界夹住，换筛子回第一条 ----------
+    import types
+
+    from src import ui as U
+
+    class _FakeSS(dict):
+        """假 session_state：Streamlit 的 state 两种取值法（state.x / state["x"]）都得支持。"""
+
+        def __getattr__(self, k):
+            try:
+                return self[k]
+            except KeyError as e:
+                raise AttributeError(k) from e
+
+        def __setattr__(self, k, v):
+            self[k] = v
+
+    d2, db2, bid2, ids2 = _tmp_db(250)
+    saved_st = U.st
+    try:
+        for i, vid in enumerate(ids2):
+            db2.update_analysis(vid, {"status": "analyzed", "retention_score": i,
+                                      "verdict": "trash", "decision_trace": {}})
+        fake = types.SimpleNamespace(session_state=_FakeSS(),
+                                     toast=lambda *a, **k: None, rerun=lambda: None)
+        U.st = fake
+        fake.session_state.update({"q_page": 0, "idx": 0})
+        U._queue_ensure(db2, 100, {})
+        check(len(fake.session_state["queue"]) == 100, "初始只加载第一页 100 条")
+        U._queue_jump(db2, 150, 100, {})
+        check(fake.session_state["q_page"] == 1 and fake.session_state["idx"] == 50,
+              "跳到第 151 条 → 第 2 页第 51 格")
+        check(len(fake.session_state["queue"]) == 100,
+              "跳转只加载所在那一页，不拉全量队列")
+        U._queue_jump(db2, 99999, 100, {})
+        check(fake.session_state["q_page"] == 2 and fake.session_state["idx"] == 49
+              and len(fake.session_state["queue"]) == 50,
+              "越界跳转夹到最后一条（末页只有 50 条）")
+        U._queue_step(db2, 1, 100, {})
+        check(fake.session_state["idx"] == 49, "已在末尾时「下一条」原地不动")
+        fake.session_state["rv_min_score"] = 200.0
+        U._queue_ensure(db2, 100, U._queue_filters())
+        check(fake.session_state["q_page"] == 0 and fake.session_state["idx"] == 0,
+              "换了筛选条件：从第一条重载，而不是停在旧位置")
+        check(len(fake.session_state["queue"]) == 50,
+              "筛选后的队列按新口径只有 50 条")
+    finally:
+        U.st = saved_st
+        shutil.rmtree(d2, ignore_errors=True)
+
+    # ---------- C. UI 接线（源码级，防改后端忘挂控件） ----------
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    check("def _queue_jump" in ui_src and "db.count_review_queue(**filt)" in ui_src,
+          "审核台：跳转位置由同一组谓词算出（不自己扫队列）")
+    check('key="rv_jump_idx"' in ui_src and 'key="rv_jump_score"' in ui_src
+          and "count_review_below" in ui_src,
+          "审核台：条号跳转 + 分数跳转两个入口")
+    check("offset=page * size, **filt" in ui_src,
+          "队列分页查询透传筛选条件（只改显示不改查询=假筛选）")
+    check('key="grid_jump_page"' in ui_src and 'key="grid_first"' in ui_src
+          and 'key="grid_last"' in ui_src,
+          "批量浏览：页码跳转 + 首页/末页")
+    check("_queue_sig" in ui_src and "filt_changed" in ui_src,
+          "筛选条件指纹变化即重载（否则筛选后停在空页）")
+    check("**fil)" in ui_src and "def _grid_filters" in ui_src,
+          "批量浏览与审核台共用同一套筛选谓词（两页条目口径一致）")
+
+
+def test_coarse_suspect_kept():
+    """Track C · C1（ADR 0006）：粗扫看到、精扫没确认的目标要**降级保留**，不能丢。
+
+    这是本次改动里最值钱的一条 —— 旧口径把这类检出直接扔掉，导致 474 条视频
+    "粗扫明明看到过目标、最终零产物"，原片删掉后一个字都不留。
+    """
+    section("Track C · C1 粗扫疑似降级保留")
+    from src.highlighter import LV_CONFIRMED, LV_SUSPECT, merge_two_levels
+
+    # 粗扫在 t=10 检出一个人（落在已精扫的窗内），精扫没确认 → f_hits 为空
+    c_hits = [{"t": 10.0, "conf": 0.20, "n_person": 1, "max_area": 0.05,
+               "level": LV_SUSPECT, "motion_only": False}]
+    c_diffs = [0.0] * 40
+    scanned = [(8.0, 12.0)]
+
+    kept, n_down = merge_two_levels(c_hits, [], c_diffs, 4.0, scanned, 0.05,
+                                    fine_on=True, keep_coarse_suspect=True)
+    check(n_down == 1 and len(kept) == 1 and kept[0]["level"] == LV_SUSPECT,
+          f"粗扫有目标、精扫没确认 ⇒ 降级保留为 C 疑似（{len(kept)} 条）")
+
+    dropped, n_down2 = merge_two_levels(c_hits, [], c_diffs, 4.0, scanned, 0.05,
+                                        fine_on=True, keep_coarse_suspect=False)
+    check(not dropped and n_down2 == 0,
+          "keep_coarse_suspect=False 退回旧行为（丢弃）—— 开关能一键回到改动前")
+
+    # 精扫确认的照常进（升级权还在）
+    f_hits = [{"t": 10.0, "conf": 0.31, "n_person": 1, "max_area": 0.08,
+               "level": LV_CONFIRMED, "motion_only": False}]
+    conf, _ = merge_two_levels(c_hits, f_hits, c_diffs, 4.0, scanned, 0.05,
+                               fine_on=True, keep_coarse_suspect=True)
+    check(any(h["level"] == LV_CONFIRMED for h in conf),
+          "精扫确认的仍按确认级保留（精扫是升级权，不是否决权）")
+
+    # 超预算没精扫到的窗：有动静才留（与旧行为一致）
+    far = [{"t": 100.0, "conf": 0.2, "n_person": 1, "max_area": 0.05,
+            "level": LV_SUSPECT, "motion_only": False}]
+    d2 = [0.0] * 500
+    d2[400] = 0.09
+    got, _ = merge_two_levels(far, [], d2, 4.0, scanned, 0.05,
+                              fine_on=True, keep_coarse_suspect=True)
+    check(len(got) == 1, "未精扫的窗：有动静 ⇒ 保留为疑似（没复核过不能当否决）")
+
+
+def test_c_cut_mp4():
+    """Track C · C2/C4：C 级也要产出**可播放**的 mp4 与多张代表帧。"""
+    section("Track C · C2/C4 C 级切视频 + 多张静帧")
+    from src.highlighter import DEFAULT_C_THUMBS, HL_VERSION, HighlightCutter
+
+    cfg = load_config()
+    h = cfg["highlight"]
+    check(h.get("c_cut_mp4") is True and h.get("keep_coarse_suspect") is True,
+          "配置默认：C 级切 mp4 + 粗扫疑似保留（删前保全的两个主开关）")
+    check(str(h.get("version") or "") == HL_VERSION,
+          f"产物口径版本 = {h.get('version')}（驱动重剪队列）")
+
+    src = Path("src/highlighter.py").read_text(encoding="utf-8")
+    seg = src[src.index("def cut_one"):src.index("def run_batch")]
+    check('grade in ("A", "B") or (grade == "C" and cut_c)' in seg,
+          'C 级走切 mp4 分支（旧代码是 if grade in ("A","B")）')
+    check('"thumbs": thumbs' in seg,
+          "clips 记录多张代表帧（一张图证明不了这 30 秒里发生过什么）")
+
+    ev = {"start": 10.0, "end": 40.0, "best_t": 22.0, "dur": 30.0}
+    ts = HighlightCutter._thumb_times(ev, DEFAULT_C_THUMBS)
+    check(len(ts) == DEFAULT_C_THUMBS and ts[0] == 22.0,
+          f"C 级取 {DEFAULT_C_THUMBS} 张，首张是最高置信帧（{[round(t,1) for t in ts]}）")
+    check(len(set(round(t, 2) for t in ts)) == len(ts)
+          and all(10.0 <= t <= 40.0 for t in ts),
+          "代表帧时刻落在段内且互不重复")
+    check(HighlightCutter._thumb_times(ev, 1) == [22.0],
+          "thumb_per_clip=1 时行为不变（A/B 级不受影响）")
+
+
+def test_c_not_in_review():
+    """Track C · C3：产物**只有 C 级**的视频是档案不是待办，默认不进人工队列。
+
+    C1 会让 C 段数量级上升；若它们同时涌进审核队列，"多留"就变成了"多看"，
+    与减负目标正面冲突。这条开关只影响列表展示，不参与任何处置判定。
+    """
+    section("Track C · C3 C 级档案不入审核队列")
+    d, db, bid, ids = _tmp_db(3)
+    try:
+        for vid in ids:
+            db.update_analysis(vid, {"status": "analyzed", "retention_score": 5,
+                                     "final_score": 5, "verdict": "trash",
+                                     "has_person": 0, "decision_trace": {}})
+        db.mark_highlight(ids[0], "2026-09-10 12:00:00", 0, 0.0, [],
+                          sent=100, coarse_hits=0, version="hlv2")
+        db.mark_highlight(ids[1], "2026-09-10 12:00:00", 2, 20.0,
+                          [{"grade": "C", "file": "c.mp4", "thumb": "c.jpg"}],
+                          sent=100, coarse_hits=3, version="hlv2")
+        db.mark_highlight(ids[2], "2026-09-10 12:00:00", 1, 30.0,
+                          [{"grade": "A", "file": "a.mp4", "thumb": "a.jpg"}],
+                          sent=100, coarse_hits=3, version="hlv2")
+
+        all_rows = db.review_queue(limit=99)
+        hid = db.review_queue(limit=99, hide_c_archive=True)
+        check(len(all_rows) == 3 and len(hid) == 2,
+              f"仅 C 级档案被滤掉（不滤 {len(all_rows)} → 滤后 {len(hid)}）")
+        check(ids[1] not in [r["id"] for r in hid],
+              "只有 C 级产物的那条不再出现在人工队列")
+        check(ids[0] in [r["id"] for r in hid] and ids[2] in [r["id"] for r in hid],
+              "无产物 / 有 A 级产物的照常留在队列（筛选不过度）")
+        check(db.count_review_queue(hide_c_archive=True) == len(hid),
+              "计数与队列同口径（筛选不能只改一边）")
+        check(db.no_clip_breakdown()["total"] == 1,
+              "三义拆分只统计无产物行，不受该筛选影响")
+
+        # 放行判据（真实处置路径）绝不能被这个展示开关带偏
+        check(len(db.release_queue(limit=99, threshold=30,
+                                   require_no_person=True)) == 3,
+              "放行候选不受 hide_c_archive 影响（展示开关不参与处置判定）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_no_clip_split():
+    """Track 0：把「无精华」拆成三义，且**三数之和 == 无精华总数**。
+
+    没有这把尺子，"无精华 3780" 就永远分不清是"复核过确实没有"、
+    "压根没跑检测"、还是"粗扫看到过却被丢弃"—— 第二条曾被当成第一条用过。
+    """
+    section("Track 0 · 「无精华」拆三义")
+    d, db, bid, ids = _tmp_db(4)
+    try:
+        for vid in ids:
+            db.update_analysis(vid, {"status": "analyzed", "retention_score": 0,
+                                     "verdict": "trash", "decision_trace": {}})
+        # ① 预筛跳过 ② 已检测确实没有 ③ 粗扫看到过但被否决 ④ 有产物（不计入）
+        db.mark_highlight(ids[0], "t", 0, 0.0, [], sent=0, coarse_hits=0, version="hlv2")
+        db.mark_highlight(ids[1], "t", 0, 0.0, [], sent=120, coarse_hits=0, version="hlv2")
+        db.mark_highlight(ids[2], "t", 0, 0.0, [], sent=120, coarse_hits=7, version="hlv2")
+        db.mark_highlight(ids[3], "t", 1, 9.0,
+                          [{"grade": "B", "file": "b.mp4"}], sent=120,
+                          coarse_hits=7, version="hlv2")
+        b = db.no_clip_breakdown()
+        check((b["skipped"], b["detected_empty"], b["dropped"]) == (1, 1, 1),
+              f"三义各归各位：预筛跳过={b['skipped']} 已检测无={b['detected_empty']} "
+              f"看到过被否={b['dropped']}")
+        check(b["total"] == 3 and b["unknown"] == 0,
+              f"三数之和 = 无精华总数（{b['total']}），没有算不进去的行")
+        check(db.no_clip_breakdown()["total"] == db.highlight_stats()["done"] - 1,
+              "无精华数 + 有产物数 = 已处理数（口径自洽）")
+        # 回填前（无送检记录）的行必须显式归到 unknown，不能悄悄并进某一义
+        d2, db2, bid2, ids2 = _tmp_db(1)
+        try:
+            db2.update_analysis(ids2[0], {"status": "analyzed", "retention_score": 0,
+                                          "verdict": "trash", "decision_trace": {}})
+            db2.mark_highlight(ids2[0], "t", 0, 0.0, [])
+            b2 = db2.no_clip_breakdown()
+            check(b2["unknown"] == 1 and b2["total"] == 1,
+                  "没有送检记录的老行归入 unknown，不伪装成三义之一")
+        finally:
+            shutil.rmtree(d2, ignore_errors=True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_rehighlight_idempotent():
+    """Track C · C5：按版本重剪必须**幂等**，且只挑收益最集中的那一批。
+
+    重剪跑 1.5~8 小时，中途一定会停；停下再起不能从头再来一遍。
+    """
+    section("Track C · C5 按版本重剪（幂等）")
+    from src.highlighter import HL_VERSION
+
+    d, db, bid, ids = _tmp_db(4)
+    try:
+        for vid in ids:
+            db.update_analysis(vid, {"status": "analyzed", "retention_score": 0,
+                                     "verdict": "trash", "decision_trace": {}})
+        # ① D2 受害者：粗扫看到过、零产物   ② 只有静帧的 C  ③ 已是新口径  ④ 没剪过
+        db.mark_highlight(ids[0], "t", 0, 0.0, [], sent=100, coarse_hits=5,
+                          version="hlv1")
+        db.mark_highlight(ids[1], "t", 1, 12.0,
+                          [{"grade": "C", "file": None, "thumb": "t.jpg"}],
+                          sent=100, coarse_hits=2, version="hlv1")
+        db.mark_highlight(ids[2], "t", 1, 9.0,
+                          [{"grade": "B", "file": "b.mp4"}],
+                          sent=100, coarse_hits=1, version=HL_VERSION)
+        q = db.rehighlight_queue(limit=99, target_version=HL_VERSION, only_dropped=True)
+        got = [r["id"] for r in q]
+        check(ids[0] in got and ids[1] in got,
+              "抓到「零产物但有粗扫命中」和「只有静帧」的两类（D2/D4）")
+        check(ids[2] not in got, "已是新口径的跳过（不重复劳动）")
+        check(ids[3] not in got, "没剪过的走正常队列，不出现在重剪队列")
+        check(len(q) == 2, f"重剪队列只含目标行（{len(q)} 条）")
+
+        # 全量口径：所有版本落后的都进（不止 D2/D4）
+        db.mark_highlight(ids[2], "t", 1, 9.0, [{"grade": "B", "file": "b.mp4"}],
+                          sent=100, coarse_hits=1, version="hlv1")
+        check(len(db.rehighlight_queue(limit=99, target_version=HL_VERSION,
+                                       only_dropped=False)) == 3,
+              "only_dropped=False 时全量重剪（含已正常的 A/B 产物）")
+
+        # 幂等：重剪完把版本推上去，队列必须清空
+        db.reset_highlight_version(HL_VERSION)
+        check(db.count_rehighlight_pending(target_version=HL_VERSION) == 0,
+              "剪完版本号跟上 ⇒ 重剪队列清空（中断后重启不会重复跑）")
+        check(db.count_rehighlight_pending(target_version=HL_VERSION,
+                                           only_dropped=False) == 0,
+              "全量口径同样清空")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # jobs 里有没有真的接上（UI 按钮要靠它）
+    jsrc = Path("src/jobs.py").read_text(encoding="utf-8")
+    check("_REHIGHLIGHT" in jsrc and "def start_rehighlight" in jsrc
+          and "def count_rehighlight_pending" in jsrc,
+          "jobs 暴露重剪任务（可启动 / 可计数）")
+    check("get_rehighlight_job().running" in jsrc,
+          "any_running 纳入重剪任务（它与剪辑抢同一批源文件，不能并发）")
+
+
+def test_highlight_batch():
+    """L2.8 批处理：队列元素是 sqlite3.Row（没有 .get）时不得崩溃。
+
+    真实任务曾在此挂掉：run_batch 循环里 row 未转 dict，写 manifest 时
+    `row.get("trash_path")` 抛 AttributeError；且该行在 try 之外，
+    1 条坏数据会炸掉整批（1372 段跑几小时）。用假 db + 假 cutter 复现该路径。
+    """
+    section("精华剪辑批处理")
+    from src import highlighter as H
+
+    # 用真实 sqlite 产出真正的 sqlite3.Row，保证与线上类型完全一致
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE v (id INTEGER, trash_path TEXT)")
+    conn.executemany("INSERT INTO v VALUES (?,?)",
+                     [(1, r"G:\need-del\a.mp4"), (2, None)])
+    rows = conn.execute("SELECT * FROM v").fetchall()
+    check(isinstance(rows[0], sqlite3.Row) and not hasattr(rows[0], "get"),
+          "队列元素确为 sqlite3.Row（无 .get 方法）")
+
+    marked: list = []
+    errs: list = []
+
+    class _DB:
+        def highlight_queue(self, limit=5000, batch_id=None):
+            return rows
+
+        def mark_highlight(self, vid, ts, n, sec, clips, **kw):
+            marked.append((vid, n))
+
+        def mark_highlight_error(self, vid, msg):
+            errs.append((vid, msg))
+
+    class _Cutter(H.HighlightCutter):
+        """只 stub 掉耗时的检测/切割，保留 run_batch 的记账与写 manifest 逻辑。"""
+
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.h = cfg.get("highlight", {})   # run_batch 的自动处置(_dispose_one)会读
+
+        def cut_one(self, row, hdir, ts, log=None):
+            return {"ok": True, "id": row["id"], "stem": "s", "year": "2015",
+                    "src": "x", "duration": 10.0, "sec": 1.0, "kept_ratio": 0.1,
+                    "stats": {},
+                    "clips": [{"grade": "A", "file": "f.mp4", "thumb": "t.jpg"}]}
+
+    cfg = load_config()
+    tmp = Path(tempfile.mkdtemp(prefix="hl-batch-"))
+    cfg["highlight"]["dir"] = str(tmp)
+    try:
+        # 审核减负（ADR 0001）：run_batch 剪完会自动处置（_dispose_one）。处置走真实的
+        # mover.move_one 会碰文件系统/缺字段 —— 这里把 mover 的移动原语换成假实现，
+        # 只验证「批处理记账 + 自动处置」的编排逻辑本身。
+        from src import mover as M
+        _real_move_one, _real_decide = M.move_one, M.decide_tier
+        M.move_one = lambda db, row, cfg, tier, log=None: (True, "fake-moved")
+        M.decide_tier = lambda row, cfg: "A"
+        try:
+            res = _Cutter(cfg).run_batch(_DB(), log=lambda s: None)
+        finally:
+            M.move_one, M.decide_tier = _real_move_one, _real_decide
+        check(res["failed"] == 0,
+              f"Row 输入不再崩溃（failed={res['failed']}，errors={res['errors']}）")
+        check(res["done"] == 2, f"两条都入账（done={res['done']}）")
+        check(len(marked) == 2, f"写库 2 次（{len(marked)}）")
+        dsp = res.get("disposed", {})
+        check(dsp.get("moved") == 2 and dsp.get("not_disposed") == 0,
+              f"自动处置：两条无精华候选都移入回收（{dsp}）")
+        man = tmp / "manifest.jsonl"
+        lines = [l for l in man.read_text(encoding="utf-8").splitlines() if l.strip()]
+        check(len(lines) == 2, f"manifest 写全 2 行（{len(lines)}）")
+        check(lines and "trash_path" in json.loads(lines[0]),
+              "manifest 记录含 trash_path 字段")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_adr0001_cut_then_delete():
+    """审核减负（ADR 0001 先剪后删）回归：
+      队列谓词放宽 / 0 分桶 / _dispose_one 处置分支 / undo_move 清理不变量 / UI 接线。
+    """
+    section("审核减负 ADR 0001：0 分桶 / 处置候选队列 / 自动处置")
+    from src import highlighter as H
+
+    # ---------- A. 队列谓词放宽：review 桶入队、keep 出队 ----------
+    d, db, bid, ids = _tmp_db(6)
+    try:
+        def _an(v, verdict="trash", score=0.0, trace=None, speech=False, moved=False):
+            db.upsert_video_meta(db.get_video(v)["path"], {
+                "filename": db.get_video(v)["filename"], "rel_dir": "", "year": "2024",
+                "size_bytes": 1, "mtime": 0, "duration_sec": 60,
+                "width": 1920, "height": 1080, "video_codec": "hevc",
+                "has_audio": 1 if speech else 0, "audio_energy": None,
+                "bitrate_kbps": 1000, "meta_ok": 1, "meta_error": None})
+            _mark_analyzed(db, v, verdict, score)
+            db.update_analysis(v, {"status": "analyzed", "retention_score": score,
+                                   "final_score": score, "verdict": verdict,
+                                   "decision_trace": trace or {}})
+            if speech:
+                db.update_audio_review(v, {"audio_checked": 1, "speech_present": 1,
+                                           "speech_ratio": 0.2,
+                                           "transcript_text": "画外有人声"})
+            if moved:
+                db.set_human_decision(v, "trash",
+                                      trash_path=str(d / "t" / f"v{v}.mp4"), trash_tier="A")
+
+        _an(ids[0], "review", 5.0, speech=True)                 # review 桶未处置 + 语音
+        _an(ids[1], "trash", 5.0, moved=True, speech=True)      # 已移入回收 + 语音
+        _an(ids[2], "review", 5.0)                               # review 桶（无语音）
+        _an(ids[3], "trash", 5.0)                                # 待处置候选
+        db.set_human_decision(ids[3], "trash")                   # → 仅逻辑标记 trash 未移动
+        _an(ids[4], "review", 5.0, speech=True)                  # review 桶 + 有效语音
+        db.set_human_decision(ids[4], "keep")                    # → 人工保留
+        _an(ids[5], "trash", 5.0, moved=True)                    # 已移入回收（无语音）
+        db.mark_highlight(ids[5], "2026-09-08 12:00:00", 0, 0.0, [])  # 已剪过 → 出队
+
+        hq = {r["id"] for r in db.highlight_queue()}
+        check(hq == {ids[0], ids[1], ids[2]},
+              f"精华队列放宽：review 桶可入队（{sorted(hq)}）；"
+              "逻辑 trash/keep/已剪辑出队")
+        aq = {r["id"] for r in db.archive_queue()}
+        check(aq == {ids[0], ids[1]},
+              f"归档队列放宽：未移入回收的 review 桶 + 有效语音也能归档（{sorted(aq)}）")
+        check(all(r["highlight_at"] is None for r in db.highlight_queue())
+              and all(r["speech_present"] == 1 for r in db.archive_queue()),
+              "过滤条件对已移入回收目录的分支同样生效（OR/AND 优先级 bug 已修复）")
+        check(ids[3] not in hq and ids[4] not in hq,
+              "human 已表态（trash 未移动 / keep）不再进入处置候选")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ---------- B. 放行候选（ADR 0003）：无人物信号 / near_miss 排除 / 分数与处置过滤 ----------
+    d, db, bid, ids = _tmp_db(9)
+    try:
+        # 注意：update_analysis 是**整行覆盖**（未传的列会被写成 NULL）——
+        # 部分传参会让 verdict/retention_score 一起消失，测试就测不到想测的分支。
+        # 所以这里统一走 _upd，每次都把判定字段补全。
+        def _upd(v, **kw):
+            base = {"status": "analyzed", "retention_score": 0.0, "final_score": 0.0,
+                    "verdict": "trash", "decision_trace": {}, "has_person": 0}
+            base.update(kw)
+            db.update_analysis(v, base)
+
+        for v in ids:
+            _an(v, "trash", 0.0)
+            _upd(v)
+        # ids[0..2]：0 分且无任何人物信号 → 放行
+        # ids[3]   ：near_miss 含人物（"看到了没敢确认"，漏检高发区）→ 必须排除
+        _upd(ids[3], decision_trace={"near_miss": {"person": 0.20}})
+        # ids[4]   ：has_person=1 → 排除（语义条件的正面判据）
+        _upd(ids[4], has_person=1)
+        # ids[5]   ：分数超门槛 → 排除
+        _upd(ids[5], retention_score=40.0, final_score=40.0)
+        # ids[6]   ：verdict=review 且无人物信号、15 分 → 放行（比 ADR 0002 的 0 分桶宽）
+        _upd(ids[6], verdict="review", retention_score=15.0, final_score=15.0)
+        # ids[7]   ：已人工处置（已移入回收）→ 排除
+        db.set_human_decision(ids[7], "trash", trash_path=str(d / "x.mp4"), trash_tier="A")
+        # ids[8]   ：meta_ok=0（分析没跑完）→ 排除
+        with db.conn() as c:
+            c.execute("UPDATE videos SET meta_ok=0 WHERE id=?", (ids[8],))
+
+        q = {r["id"] for r in db.release_queue(limit=100, threshold=30,
+                                               require_no_person=True)}
+        check(q == {ids[0], ids[1], ids[2], ids[6]},
+              f"放行候选命中 {sorted(q)}"
+              "（near_miss 有人/检出人/超门槛/已处置/未分析全排除）")
+        check(db.count_release(threshold=30, require_no_person=True) == 4,
+              f"count_release = {db.count_release(threshold=30, require_no_person=True)}")
+        check(db.count_release(batch_id=99999) == 0, "按不存在的批次过滤 → 0")
+
+        # 分数门槛仍生效：门槛 10 → ids[6]（15 分）出局，说明"语义条件"没有吃掉"门槛"
+        q10 = {r["id"] for r in db.release_queue(limit=100, threshold=10,
+                                                 require_no_person=True)}
+        check(q10 == {ids[0], ids[1], ids[2]},
+              f"分数门槛生效：15 分的 review 档被挡在门槛外（{sorted(q10)}）")
+
+        # 兼容口径：门槛 0 且关闭语义条件 → 回到 ADR 0002 之前的"仅 0 分桶"
+        q0 = {r["id"] for r in db.release_queue(limit=100, threshold=0,
+                                                require_no_person=False)}
+        check(q0 == {ids[0], ids[1], ids[2], ids[3], ids[4]},
+              f"退回兼容口径（门槛 0 + 不看人物）：{sorted(q0)}")
+
+        # 放行候选仍计入待审核（放行前不消失）
+        check(db.count_review_queue() >= 4, "放行候选仍计入待审核总数（放行前）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ---------- C. _dispose_one 各分支（mover 原语打桩） ----------
+    from src import mover as M
+    calls = {"move": 0, "undo": 0, "keep": 0}
+    _real = (M.move_one, M.undo_move, M.decide_tier)
+
+    def _fake_move(db, row, cfg, tier, log=None):
+        calls["move"] += 1
+        return True, "fake-moved"
+
+    def _fake_undo(db, row, log=None):
+        calls["undo"] += 1
+        return True, "fake-undone"
+
+    def _fake_tier(row, cfg):
+        return "A"
+
+    class _DB:
+        def set_human_decision(self, vid, dec, **kw):
+            calls["keep"] += 1
+
+    dbx = _DB()
+    M.move_one, M.undo_move, M.decide_tier = _fake_move, _fake_undo, _fake_tier
+    try:
+        def _cut(**hcfg):
+            cutter = object.__new__(H.HighlightCutter)   # 跳过 __init__（不碰 ffmpeg/模型）
+            cutter.cfg = {"audio": {"enabled": hcfg.pop("audio_on", False)},
+                          "highlight": {"keep_full_ratio": 0.6,
+                                        "auto_dispose": hcfg.pop("auto", True)}}
+            cutter.h = cutter.cfg["highlight"]
+            return cutter
+
+        def _row(**kw):
+            base = {"id": 1, "human_decision": None, "has_audio": 0,
+                    "audio_checked": None, "path": "v.mp4", "retention_score": 0,
+                    "verdict": "trash"}
+            base.update(kw)
+            return base
+
+        def _r(ratio, ok=True):
+            return {"ok": ok, "kept_ratio": ratio}
+
+        c = _cut()
+        check(c._dispose_one(dbx, _row(), _r(0.5, ok=False))[0] == "skip",
+              "dispose：剪辑失败 → skip（不动任何状态）")
+        check(c._dispose_one(dbx, _row(human_decision="keep"), _r(0.9))[0]
+              == "not_disposed" and not calls["move"],
+              "dispose：人工已 keep → 不处置（产物只是额外保险）")
+        check(_cut(auto=False)._dispose_one(dbx, _row(), _r(0.9))[0]
+              == "not_disposed",
+              "dispose：auto_dispose 关闭 → 留给人工")
+
+        calls["keep"] = 0
+        act, note = c._dispose_one(dbx, _row(), _r(0.85))
+        check(act == "keep_full" and calls["keep"] == 1 and not calls["move"],
+              f"dispose：精华占比 85% > 60% → 自动整片保留（{note}）")
+
+        # 音频口径统一为"事后补"（ADR 0004）：不再拦"有音轨但没复核过"的候选 ——
+        # 音频队列已放宽为处置候选，移入回收后仍能补复核/补归档（trash_path 回落）。
+        calls["move"] = 0
+        act, note = _cut(audio_on=True)._dispose_one(
+            dbx, _row(has_audio=1, audio_checked=None), _r(0.1))
+        check(act == "moved" and calls["move"] == 1,
+              f"dispose：有音轨未复核 → 照常移入（音频走事后补，不拦住）（{note}）")
+
+        calls["move"] = 0
+        act, note = _cut(audio_on=True)._dispose_one(
+            dbx, _row(has_audio=1, audio_checked=1), _r(0.1))
+        check(act == "moved" and calls["move"] == 1,
+              f"dispose：音频已复核（audio_checked=1）→ 剪完自动移入回收（{note}）")
+
+        calls["undo"] = 0
+        act, note = c._dispose_one(dbx, _row(human_decision="trash"), _r(0.85))
+        check(act == "undo_keep" and calls["undo"] == 1,
+              f"dispose：已放行但整片有内容 → 撤销移动捞回（{note}）")
+
+        calls["move"] = 0
+        act, note = c._dispose_one(dbx, _row(human_decision="trash"), _r(0.1))
+        check(act == "not_disposed" and calls["move"] == 0,
+              f"dispose：已处置为 trash 且无高占比 → 不再重复移动（{note}）")
+    finally:
+        M.move_one, M.undo_move, M.decide_tier = _real
+
+    # ---------- D. undo_move：真库真文件，清 trash_path 不变量 ----------
+    d, db, bid, ids = _tmp_db(1)
+    try:
+        vid = ids[0]
+        src = Path(db.get_video(vid)["path"])
+        src.write_bytes(b"fake-video")
+        cfg = {"work_dir": str(d), "trash_root": str(d / "need-del")}
+        row = db.get_video(vid)
+        ok, _ = mover.move_one(db, dict(row), cfg, "A")
+        row = db.get_video(vid)
+        check(ok and row["human_decision"] == "trash"
+              and row["trash_path"] and not Path(row["path"]).exists()
+              and Path(row["trash_path"]).exists(),
+              "move_one：文件移入回收，human=trash + trash_path 落库")
+
+        ok2, _ = mover.undo_move(db, row)
+        row = db.get_video(vid)
+        check(ok2 and Path(row["path"]).exists()
+              and not (row["trash_path"] and Path(row["trash_path"]).exists()),
+              "undo_move：文件回到原位")
+        check(row["human_decision"] == "keep" and row["trash_path"] is None
+              and row["trash_tier"] is None,
+              "undo_move：keep 行 trash_path/trash_tier 清空（不残留失效回收路径）")
+        check(vid not in {r["id"] for r in db.highlight_queue()}
+              and vid not in {r["id"] for r in db.archive_queue()}
+              and vid not in {r["id"] for r in db.list_moved()},
+              "undo 后不再进入任何处置候选/可撤销队列（无二次处理）")
+
+        # 处置翻转：keep 后再标记 trash（无路径）不得继承旧路径
+        db.set_human_decision(vid, "trash")
+        row = db.get_video(vid)
+        check(row["human_decision"] == "trash" and row["trash_path"] is None,
+              "处置翻转不继承失效 trash_path（曾因 COALESCE 残留错报清单）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ---------- E. UI 接线（源码级，防改 UI 忘接后端） ----------
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    db_src = Path("src/db.py").read_text(encoding="utf-8")
+    check("_render_release_candidates(db, cfg)" in ui_src
+          and "def _render_release_candidates" in ui_src,
+          "UI：审核台页签顶部挂载「无人候选」放行卡（ADR 0003）")
+    check('一键放行' in ui_src and "mover.move_all(db, rows, cfg)" in ui_src
+          and "db.release_queue(" in ui_src,
+          "UI：放行按钮 → release_queue + move_all 全量放行")
+    check("_PENDING_OR_TRASHED" in db_src
+          and "human_decision IS NULL AND verdict IN ('trash','review')" in db_src,
+          "db：archive/highlight 共用放宽后的处置候选谓词")
+    check('60%' in ui_src and '整片保留' in ui_src and '先剪后删' in ui_src,
+          "UI：设置页精华剪辑 caption 说明自动保留/自动移入规则")
+    check('r.get("disposed", {})' in ui_src or "disposed" in ui_src,
+          "UI：任务完成摘要展示自动处置统计")
+
+
+def test_adr0004_pipeline():
+    """一键执行（ADR 0004）回归：阶段顺序 / 前置总检 / 阶段调度 / 失败即停 / UI 接线。"""
+    section("一键执行 ADR 0004：阶段串联 / 前置检查 / 失败即停")
+    import copy
+
+    from src import jobs as J
+    from src.config import DEFAULT_CONFIG
+
+    # ---------- A. 阶段顺序由依赖决定，不是随意排的 ----------
+    keys = [k for k, _ in J.PIPELINE_STAGES]
+    check(keys == ["scan", "analyze", "audio", "archive", "release", "highlight"],
+          f"阶段顺序：{keys}")
+    check(keys.index("analyze") < keys.index("audio") < keys.index("archive"),
+          "依赖：分析先于音频复核，音频复核先于语音归档")
+    check(keys.index("release") < keys.index("highlight"),
+          "依赖：放行必须在剪辑之前（反序会被剪辑的自动处置清空成空操作）")
+
+    # ---------- B. 前置总检：缺什么拦什么，缺一个就拒绝启动 ----------
+    base = copy.deepcopy(DEFAULT_CONFIG)
+    base["work_dir"] = ""
+    base["source_root"] = ""
+    base["trash_root"] = ""
+    base["audio"]["enabled"] = False
+    allon = {"stages": {k: True for k in keys}}
+    probs = J.pipeline_precheck(base, allon)
+    check(any("work_dir" in p for p in probs)
+          and any("source_root" in p for p in probs)
+          and any("trash_root" in p for p in probs),
+          f"前置检查：缺 work_dir / 源目录 / 回收目录都被拦（共 {len(probs)} 条）")
+    check(any("音频复核未启用" in p for p in probs),
+          "前置检查：勾了音频阶段但 enabled=false → 明确提示（并告知可取消勾选）")
+
+    base["work_dir"] = "."
+    check(J.pipeline_precheck(base, {"stages": {k: False for k in keys}}) == [],
+          "前置检查：阶段全不勾 → 只剩 work_dir 一条硬条件，不再误报")
+    check(J.pipeline_precheck(base, {"stages": {k: (k == "analyze") for k in keys}}) == [],
+          "前置检查：只跑分析时不误报目录/引擎缺失（按勾选范围查）")
+
+    # ---------- C. 阶段调度：顺序 / 跳过 / 失败即停 / 停止 ----------
+    cfg = {"work_dir": "."}
+    opts = {"stages": {"scan": True, "analyze": True, "audio": True,
+                       "archive": False, "release": True, "highlight": True},
+            "scan_limit": 10, "scan_with_audio": False, "stage_limit": 100}
+    real_stage = J._run_stage
+    calls = []
+
+    def _fake_stage(job, db, cfg, key, opts):
+        calls.append(key)
+        job.result = {"fake": key}
+        return f"{key} 完成"
+
+    job = J.Job("pipeline")
+    J._run_stage = _fake_stage
+    try:
+        J._run_pipeline(job, None, cfg, opts)
+    finally:
+        J._run_stage = real_stage
+    check(calls == ["scan", "analyze", "audio", "release", "highlight"],
+          f"调度：未勾选的 archive 被跳过，其余按依赖顺序跑（{calls}）")
+    check(job.stage_count == 5 and job.stage_index == 5,
+          f"面板阶段计数：{job.stage_index}/{job.stage_count}")
+    check([s["key"] for s in job.result["stages"]] == calls
+          and not job.result["aborted"],
+          "结果：逐阶段摘要齐全、未标记中断")
+
+    def _boom(job, db, cfg, key, opts):
+        calls.append(key)
+        if key == "audio":
+            raise J.PipelineError("引擎未就绪")
+        return "ok"
+
+    calls.clear()
+    job2 = J.Job("pipeline")
+    err = ""
+    J._run_stage = _boom
+    try:
+        J._run_pipeline(job2, None, cfg, opts)
+    except J.PipelineError as e:      # noqa: PERF203 故意接住，验证"停在哪"
+        err = str(e)
+    finally:
+        J._run_stage = real_stage
+    check(calls == ["scan", "analyze", "audio"] and "音频复核" in err,
+          f"失败即停：音频复核抛错后 release/highlight 一个都没跑（{calls}）")
+    check(job2.result.get("aborted") and job2.result.get("stopped_at") == "音频复核",
+          "失败后结果写明停在哪一步（面板据此提示「修好再点一次」）")
+    check(job2.result["stages"][-1]["status"] == "error",
+          "失败阶段的摘要状态为 error（面板按 ❌ 渲染）")
+
+    def _stop_after_first(job, db, cfg, key, opts):
+        calls.append(key)
+        job._stop.set()               # 模拟用户在第一阶段跑完后点了停止
+        return "ok"
+
+    calls.clear()
+    job3 = J.Job("pipeline")
+    J._run_stage = _stop_after_first
+    try:
+        J._run_pipeline(job3, None, cfg, opts)
+    finally:
+        J._run_stage = real_stage
+    check(calls == ["scan"], f"停止：当前阶段收尾后不再进入下一阶段（{calls}）")
+
+    # ---------- D. 启动入口：前置不过就拒绝，且不留僵尸 running ----------
+    ok, msg = J.start_pipeline(None, base,
+                               {"stages": {k: (k == "audio") for k in keys}})
+    check(not ok and "音频复核未启用" in msg,
+          f"start_pipeline：前置不过直接拒绝并列出原因（{msg.splitlines()[0]}）")
+    check(not J.get_pipeline_job().running, "被拒绝时不留下 running 状态的僵尸任务")
+
+    # ---------- E. any_running 必须把流水线算进去 ----------
+    pj = J.get_pipeline_job()
+    pj.status = "running"
+    pj._thread = type("T", (), {"is_alive": lambda self: True})()
+    check(J.any_running(),
+          "any_running：一键执行在跑时，其它启动按钮/放行按钮必须一起禁用")
+    pj.__init__("pipeline")           # 复位，避免污染后续测试
+    check(not J.any_running(), "复位后不再算运行中")
+
+    # ---------- F. UI / jobs 接线（源码级，防改后端忘接线） ----------
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    jobs_src = Path("src/jobs.py").read_text(encoding="utf-8")
+    check("def _render_pipeline" in ui_src and "_render_pipeline(db, cfg)" in ui_src
+          and "⚡ 一键执行" in ui_src,
+          "UI：设置页置顶「一键执行」区")
+    check("jobsmod.start_pipeline(db, cfg, opts)" in ui_src
+          and "⚡ 一键执行（跑完到「回收目录就绪」）" in ui_src,
+          "UI：一个大按钮 → start_pipeline")
+    check("_render_step_by_step(db, cfg, limit)" in ui_src
+          and "高级 / 分步执行" in ui_src,
+          "UI：原分散段落折叠进「高级 / 分步」")
+    check("{job.stage_index}/{job.stage_count}" in ui_src
+          and "逐阶段列结果" in ui_src,
+          "UI：面板显示当前阶段与逐阶段结果（否则 3/6 的进度条会被误读）")
+    check("_PIPELINE = \"pipeline\"" in jobs_src and "def start_pipeline" in jobs_src
+          and "def pipeline_precheck" in jobs_src and "PIPELINE_STAGES" in jobs_src,
+          "jobs：流水线任务类型 / 前置检查 / 启动入口齐备")
+
+
 def main() -> int:
     cfg = load_config()
     test_misjudgment(cfg)
@@ -1155,6 +1971,15 @@ def main() -> int:
     test_grid_video_play()
     test_rerun_analysis()
     test_review_queue_selfheal()
+    test_review_jump_nav()
+    test_coarse_suspect_kept()
+    test_c_cut_mp4()
+    test_c_not_in_review()
+    test_no_clip_split()
+    test_rehighlight_idempotent()
+    test_highlight_batch()
+    test_adr0001_cut_then_delete()
+    test_adr0004_pipeline()
 
     print()
     print("=" * 66)
