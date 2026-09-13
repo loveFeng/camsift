@@ -90,13 +90,19 @@ def main() -> int:
     print("Track 0/Track C 控件：C 级档案开关 + 无精华三义说明在位")
 
     # 回归：回调里的未定义变量只有真点一次才暴露
-    at.button(key="rv_jump_score_go").click().run()
-    if at.exception:
-        print("❌ 「跳到分数 ≥」回调抛异常：")
-        for e in at.exception:
-            print(f"   {e.value}")
-        return 1
-    print("审核台「跳到分数 ≥」回调：无异常")
+    _btn = at.button(key="rv_jump_score_go")
+    if _btn.disabled:
+        # 活库上跑：当前筛选下 total=0 时按钮合法地被禁用（disabled=total <= 0），
+        # AppTest 拒绝点击 disabled 控件 —— 跳过点击而不是让冒烟假失败
+        print("⚠️ 「跳到分数 ≥」当前被禁用（该筛选下无候选），跳过点击回归")
+    else:
+        _btn.click().run()
+        if at.exception:
+            print("❌ 「跳到分数 ≥」回调抛异常：")
+            for e in at.exception:
+                print(f"   {e.value}")
+            return 1
+        print("审核台「跳到分数 ≥」回调：无异常")
 
     print("✅ UI 渲染冒烟通过：整页无异常，一键执行区、六个阶段开关、跳转筛选控件在位")
     return 0

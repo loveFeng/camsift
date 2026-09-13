@@ -337,6 +337,18 @@ def job_panel(job, title: str, key: str):
                 f"疑似静帧 {g.get('C', 0)} 张，无精华 {r.get('empty', 0)} 段，"
                 f"失败 {r.get('failed', 0)} 段，用时 {fmt_eta(job.elapsed)}"
                 f"{disp_txt}")
+        elif job.kind == "rehighlight":
+            # 重剪的核心指标是「救回」：零产物→有产物（rescued）/ 只有静帧→有视频（upgraded）
+            st.success(
+                f"{icon} 精华重剪完成：处理 {r.get('done', 0) + r.get('empty', 0)} 段 —— "
+                f"救回 {r.get('rescued', 0)} 段（零产物→有产物），"
+                f"升级 {r.get('upgraded', 0)} 段（只有静帧→有视频），"
+                f"切出视频 {r.get('clips', 0)} 段，无精华 {r.get('empty', 0)} 段，"
+                f"失败 {r.get('failed', 0)} 段，用时 {fmt_eta(job.elapsed)}")
+            if r.get("failed"):
+                with st.expander("失败明细"):
+                    for e in (r.get("errors") or [])[:20]:
+                        st.caption(f"· {e}")
         else:
             st.success(
                 f"{icon} 分析完成：成功 {r.get('analyzed', 0)}，失败 {r.get('errors', 0)}"
@@ -1142,6 +1154,9 @@ def tab_progress(db, cfg):
     _hj = jobsmod.get_highlight_job()
     if _hj.status != "idle":
         job_panel(_hj, "🎞 画面精华剪辑", "highlight_progress")
+    _rj = jobsmod.get_rehighlight_job()
+    if _rj.status != "idle":
+        job_panel(_rj, "♻️ 画面精华重剪", "rehighlight_progress")
 
     st.divider()
     st.markdown("##### 批次进度")
@@ -1324,6 +1339,9 @@ def tab_highlight(db, cfg):
     if job.running:
         _hj = job
         job_panel(_hj, "🎞 画面精华剪辑", "highlight_page")
+    _rj2 = jobsmod.get_rehighlight_job()
+    if _rj2.status != "idle":
+        job_panel(_rj2, "♻️ 画面精华重剪", "rehighlight_page")
 
     if not clips:
         if n_err:
@@ -1846,6 +1864,13 @@ def _render_step_by_step(db, cfg, limit: int):
                                                      only_dropped=True)
                 st.success(msg) if ok else st.warning(msg)
                 st.rerun()
+            # 重剪在后台线程里跑，本页只在 rerun 时刷一次快照 —— 实时面板在「执行进度」页
+            _rj = jobsmod.get_rehighlight_job()
+            if _rj.running:
+                st.info(f"♻️ 重剪进行中：**{_rj.processed} / {_rj.total}**"
+                        f"（{_rj.progress_ratio * 100:.0f}%）· 正在处理 "
+                        f"`{_rj.current or '…'}` · 预计剩余 {fmt_eta(_rj.eta_sec)}"
+                        "　→ **实时进度见「执行进度」页**")
     elif _n_re_all:
         st.caption(f"另有 **{_n_re_all}** 条版本落后、**产物正常**的行，暂不重剪 —— "
                    "它们是取舍掉的那一批（收益集中在上面那批症状行），"
