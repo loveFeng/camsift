@@ -28,6 +28,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Windows GBK 终端编不了码 emoji（ui.py 按钮文案里有 🗑 等），
+# 在模块装载阶段就把 stdout/stderr 切到 UTF-8，让所有 [OK]/[FAIL] 输出能落地。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 from src import feedback as fb  # noqa: E402
 from src import mover  # noqa: E402
 from src import config as cfgmod  # noqa: E402

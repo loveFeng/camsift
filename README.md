@@ -16,6 +16,10 @@
 
 **扫描与分析都跑在后台线程里**：启动后可以随意切页签、继续审核，进度每秒自动刷新，随时可停止（在当前文件处理完收尾，已完成的写入不丢）。
 
+> 📚 **想知道代码是怎么写的**：从 **[docs/架构设计.md](docs/架构设计.md)** 开始（分层 / 数据流 / 生命周期 / 设计取舍）；
+> 字段与队列谓词看 [docs/数据模型.md](docs/数据模型.md)；**现在该做什么**看 [docs/待办与风险.md](docs/待办与风险.md)。
+> 全部文档的导览见 [docs/README.md](docs/README.md)。
+
 ## 判定逻辑（一句话）
 
 录像是动了，但动的是什么？**没检出人/车，只有画面变化** → 判为环境误触发（树叶/光影/车灯），建议清理。检出人/车/动物 → 保留。**画面无人但有音轨的候选，清理前会先过音频复核**（有声事件捞回，见 `docs/设计档案-10TB筛选系统.md` §3.6）。
@@ -83,15 +87,20 @@ src/
   cli.py        命令行入口（想脱离 UI 长期跑时用）
   ui.py         Streamlit 审核工作台
 scripts/
-  download_model.py  下载 YOLO ONNX 模型（--spec 可选 yolov8/yolo11 的 n/s/m，并逐输入尺寸校验）
+  selftest.py        核心逻辑自测（回归；数百项断言，含"src/ 无删除调用"的代码审计）
+  smoke_ui.py        UI 渲染冒烟（Streamlit AppTest 跑整页）
+  smoke_audio.py     音频引擎冒烟（真实中文语音 vs 纯噪声）
+  download_model.py  下载 YOLO ONNX 模型（--spec 可选 yolov8/yolo11 的 n/s/m，逐输入尺寸校验两道门）
+  download_audio_models.py  下载 FunASR 模型（fsmn-vad / paraformer-zh / ct-punc，约 1.2GB）
+  setup_audio_engine.py     安装 L2.5 音频引擎依赖（绕开 funasr 的 numpy<2 pin）
   compare_models.py  模型对照实验：同批已目视标注的产物比"换模型 / 换输入尺寸"有没有用
   align_subdirs.py   存量对齐：把回收目录里的原片按保全状态归入「已剪辑」/「待保全」（默认干跑，--apply 才搬）
+  audit_requirements.py  只读体检：四条诉求对现库实数（数字复现入口）
   audit_highlight.py 产物体检：列「检出过却零产物 / 只有静帧」的行（按症状×版本分桶，标出"版本已是目标值却为空"的可疑行）；--recut N 抽样重跑估救回率（不写库）
-  selftest.py        核心逻辑自测
-  smoke_ui.py        UI 渲染冒烟（Streamlit AppTest 跑整页）
-  compile_period.py  周期合辑：按周/按月把精华片段拼成一条成片（原型，见 docs/项目体检与周期合辑可行性.md）
+  compile_period.py  周期合辑：按周/按月把精华片段拼成一条成片（原型，见 docs/周期合辑方案.md）
   _legacy/           一次性诊断/回填脚本，已完成使命，不再维护
-docs/                文档导览见 docs/README.md（哪份现行、哪份是档案，一张表说清）
+docs/                文档导览见 docs/README.md；实现文档从 docs/架构设计.md 开始，
+                     待办与风险只有一个登记簿：docs/待办与风险.md
 ```
 
 ## 命令行（后台跑分析）

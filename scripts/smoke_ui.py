@@ -18,6 +18,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Windows GBK 终端编不了码 emoji（按钮文案里有 ⚡ / 🗑 等），
+# 让所有 print 输出能落地。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
 
