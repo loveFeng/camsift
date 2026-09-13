@@ -42,10 +42,13 @@
 
 > 完整的从零开始说明、完整使用流程、常见问题排查见 **[docs/启动与使用指南.md](docs/启动与使用指南.md)**
 
+> 首次运行会自动创建两个本地文件，均**不入库**：`.venv/`（虚拟环境）与 `config.json`
+>（你的本机路径与阈值。已入库的是 `src/config.py` 的 `DEFAULT_CONFIG` 默认值，缺失时自动重建）。
+
 命令行启动（等价效果）：
 
 ```bash
-cd E:/code/video-search
+cd <项目目录>   # 本仓库 clone 后所在位置
 .venv/Scripts/python.exe -m streamlit run src/ui.py --server.port=8501
 ```
 
@@ -104,6 +107,13 @@ docs/                文档导览见 docs/README.md；实现文档从 docs/架�
 ```
 
 ## 命令行（后台跑分析）
+
+首次先创建虚拟环境并装依赖（`.bat` 会自动做这两步，命令行则手动）：
+
+```bash
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+```
 
 ```bash
 .venv/Scripts/python.exe -m src.cli scan    --root D:/监控/2024 --limit 500
