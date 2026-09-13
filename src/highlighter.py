@@ -27,7 +27,8 @@ L1 判定阶段每段只抽 12-16 帧 —— 43 秒视频里只有 2.5% 的画�
 
     A_确认/  精扫确认有目标，且 ≥8s 或多人同框   → mp4（含原音）+ 代表帧
     B_短暂/  精扫确认有目标，2-8s                → mp4（含原音）+ 代表帧
-    C_疑似/  粗扫看到但精扫没确认，或只有大幅动静 → mp4（含原音）+ 多张代表帧
+    C_疑似/  粗扫看到但精扫没确认（**含孤立的单帧检出**），或只有大幅动静
+             → mp4（含原音）+ 多张代表帧
 
 **C 级也切 mp4**（Track C · ADR 0006）：本模块的定位是"原片被删之前的最后一道保全"，
 静帧只能证明"某一秒有过东西"，而"删除后再也找不到"要的是能回放的整段。
@@ -37,6 +38,10 @@ C 段不进人工审核队列（它是**档案**不是**待办**），所以"多
 ------
     粗扫抽帧 → CLAHE → 帧差预筛 → 检测(0.15) → 候选窗 → 精扫抽帧 → 检测(0.25)
     → 事件聚合 → 分级 → A/B 重编码切割 / C 抽代表帧 → manifest
+
+聚合阶段的两条铁律（hlv3 起由 merge_two_levels / merge_events 保证）：
+**检出必留**（哪怕只有孤立一帧）、**min_duration 只剪纯动静**。
+两处曾经各自丢掉过整段产物，让真人画面变成"零产物 ⇒ 可直接删"。
 
 三个必须遵守的约束
 ------------------
@@ -79,9 +84,18 @@ LV_SUSPECT = 1
 # 产物口径版本（写进 videos.highlight_version，驱动重剪队列）：
 #   hlv1 = 旧口径：粗扫疑似被精扫否决后**直接丢弃**；C 级只留一张静帧
 #   hlv2 = 删前保全口径：粗扫疑似降级保留；C 级也切可播放 mp4
-# 换口径时改这里（或配置 highlight.version），已剪过的行版本落后即自动进重剪队列。
+#   hlv3 = 把 hlv2 承诺了却没做到的两处补齐 —— 粗扫检出**一律**保留，不再因为
+#          "该窗没被精扫到 + 动静小于 motion_fallback_threshold"而丢弃；
+#          且孤立命中不再被 min_duration 当"一闪而过的误检"吞掉。
+#          hlv2 下这两处仍会吃掉整段产物：实测 621 条"粗扫命中过却零产物"
+#          + 9 条"只有静帧"，其中 489 条正躺在回收目录里被判成"可直接删"。
+#
+# ⚠️ 换口径必须**同时**改三处，否则 mover 与剪辑器各按一个版本号判事
+#    （config 落后 ⇒ 新剪的行被永远当成"没保全"，回收目录永不归零）：
+#      这里 / db.HIGHLIGHT_TARGET_VERSION / config.json 的 highlight.version
+#    selftest 有断言钉住三者相等。
 HL_VERSION_LEGACY = "hlv1"
-HL_VERSION = "hlv2"
+HL_VERSION = "hlv3"
 
 # C 级每段留几张代表帧（配置 highlight.c_thumbs 的默认值）。
 # 一张图证明不了"这 30 秒里发生过什么"，而多抽两张的成本约等于一次 ffprobe。
@@ -234,8 +248,14 @@ def merge_events(
     events: List[Dict[str, Any]] = []
     for g in groups:
         start, end = g[0]["t"], g[-1]["t"]
-        if end - start < min_duration:
-            continue        # 一闪而过，八成是误检
+        # min_duration 只用来剪**纯动静**的碎屑（闪过的噪点、物体晃动）。
+        # 真正**检出过目标**的帧（motion_only=False）哪怕只剩一帧也必须留 ——
+        # "人坐着不动、只在某一帧被检出"这种情形下它是唯一证据，而"原片删掉后
+        # 再也找不到"不可逆。此前一律按时长丢弃，实测让 621 条确有真人的画面
+        # 变成零产物、进而被判成"可直接删"（hlv3 修复）。
+        # 缺 motion_only 键时按"检出"处理（保留），方向选安全的那一侧。
+        if end - start < min_duration and all(x.get("motion_only") for x in g):
+            continue
         level = max(x["level"] for x in g)
         conf = max(x["conf"] for x in g)
         n_person = max(x["n_person"] for x in g)
@@ -313,8 +333,7 @@ def build_windows(hits: List[Dict[str, Any]], duration: float,
 
 
 def merge_two_levels(c_hits: List[Dict[str, Any]], f_hits: List[Dict[str, Any]],
-                     c_diffs: List[float], c_fps: float,
-                     scanned: List[Tuple[float, float]], fb_thr: float,
+                     scanned: List[Tuple[float, float]],
                      fine_on: bool,
                      keep_coarse_suspect: bool = True) -> Tuple[List[Dict[str, Any]], int]:
     """合并粗扫（640/0.15）与精扫（1280/0.25）两级的检出。返回 (hits, 降级保留条数)。
@@ -323,25 +342,30 @@ def merge_two_levels(c_hits: List[Dict[str, Any]], f_hits: List[Dict[str, Any]],
 
         精扫确认              → 升为 A/B
         精扫没确认但粗扫看到   → 降级保留为 C 疑似（keep_coarse_suspect=False 时退回旧行为：丢弃）
-        超预算没精扫到的窗     → 有动静则保留为 C 疑似
+        超预算没精扫到的窗     → 检出照样保留为 C 疑似
         只有动静没有目标       → C 疑似（精扫只认目标不认动静）
 
     为什么旧行为（丢弃）是错的：低照度素材上 1280 会把置信度压低
     （实测同一帧 0.42 → 0.19），"精扫没确认"不等于"没有"。
     旧口径因此让 474 条视频"粗扫看到过目标、最终零产物"，删除后一个字都不留。
+
+    hlv3 —— **检出必留**：此前"该窗没精扫到"还要额外满足"有动静"
+    （`c_diffs > fb_thr`）才保留，于是"人坐着、只有小动作"（动静低于阈值）
+    又被丢掉一次，实测 621 条。预算不足而没精扫到的窗，本来就在 cut_one 的
+    注释里承诺"其粗扫检出按疑似保留"，这次让代码跟上注释。
     """
     hits = list(f_hits) if fine_on else list(c_hits)
     downgraded = 0
     if fine_on and c_hits:
         for x in c_hits:
-            idx = min(int(x["t"] * c_fps), len(c_diffs) - 1) if c_diffs else 0
             if x.get("motion_only"):
                 hits.append(dict(x, level=LV_SUSPECT))
                 continue
             scanned_here = bool(scanned) and any(ws <= x["t"] <= we for ws, we in scanned)
             if not scanned_here:
-                if c_diffs and c_diffs[idx] > fb_thr:
-                    hits.append(dict(x, level=LV_SUSPECT))
+                # 没被精扫覆盖（超预算等）：检出直接降级保留。这条**不受**
+                # keep_coarse_suspect 控制 —— 那个开关只管"精扫过了但没确认"。
+                hits.append(dict(x, level=LV_SUSPECT))
                 continue
             if keep_coarse_suspect:
                 downgraded += 1
@@ -598,6 +622,11 @@ class HighlightCutter:
             f_hits: List[Dict[str, Any]] = []
             fine_on = bool(h.get("fine_enabled", True)) and self.fine is not None
             windows: List[Tuple[float, float]] = []
+            # scanned 必须在 if **外面**初始化：合并两级结果时无条件要用它，而
+            # "粗扫零命中"（预筛跳过、或确实没有目标）恰恰是最常见的一类 ——
+            # 曾经把它定义在 if 里，于是这 1,382 条不是记成"无精华"，而是抛
+            # UnboundLocalError 被踢出队列（静默漏检，比误报更贵）。
+            scanned: List[Tuple[float, float]] = []
             if fine_on and c_hits:
                 # 只有"真有动静"处的粗扫检出才值得精扫 —— 静态画面上的低置信度
                 # 检出几乎一定是噪点，精扫也是浪费
@@ -613,7 +642,6 @@ class HighlightCutter:
                 windows.sort(key=lambda w: -max(
                     (x["conf"] for x in seeds if w[0] <= x["t"] <= w[1]), default=0.0))
                 used = 0
-                scanned: List[Tuple[float, float]] = []
                 stats["windows"] = len(windows)
                 stats["fine_sent"] = 0
                 for i, (ws, we) in enumerate(windows):
@@ -639,7 +667,7 @@ class HighlightCutter:
             # 粗扫看到而精扫没确认的目标降级保留为 C 疑似，不再丢弃。
             keep_cs = bool(h.get("keep_coarse_suspect", True))
             hits, downgraded = merge_two_levels(
-                c_hits, f_hits, c_diffs, c_fps, scanned, fb_thr, fine_on, keep_cs)
+                c_hits, f_hits, scanned, fine_on, keep_cs)
             stats["coarse_downgraded"] = downgraded
             stats["hits"] = len(hits)
         finally:
@@ -918,8 +946,11 @@ class HighlightCutter:
             # 命令式的东西靠顺序保证 —— 一键执行的链路里音频复核排在剪辑之前。
 
             # 剪完留底（含确认无精华）→ 移入回收目录，交由人工手动清空
+            # clips 必须显式传**本次新剪出**的产物：move_one 会回库取新鲜行判
+            # 保全状态（旧快照的 highlight_at 还是 NULL），但产物清单这里给最准。
             tier = decide_tier(row, self.cfg)
-            ok, msg = move_one(db, row, self.cfg, tier, log)
+            ok, msg = move_one(db, row, self.cfg, tier, log,
+                               clips=r.get("clips") or [])
             if ok:
                 return "moved", "精华已留底，自动移入回收目录"
             return "not_disposed", f"想移入回收但失败：{msg}（产物已留底，可人工处理）"

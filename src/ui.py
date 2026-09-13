@@ -1780,7 +1780,8 @@ def _render_step_by_step(db, cfg, limit: int):
     st.caption(
         "音频归档管声音，这里管画面：对**待处置候选**（已移入回收目录 + 判定待清理/"
         "需人工确认的 review 桶）做两级检测（3fps@640 粗扫全片 + 4fps@1280 精扫候选窗），"
-        "把画面里还有点东西的几秒自动剪出来。**A/B 级切视频含原音，C 级疑似只留静帧**。\n\n"
+        "把画面里还有点东西的几秒自动剪出来。**A/B/C 三级都切可播放视频**"
+        "（含原音）—— C 级是**档案**不是待办，所以「多留」不会变成「多看」。\n\n"
         "**审核减负（先剪后删）**：剪完自动处置未处置候选 —— 精华占比 >60% 的自动"
         "**整片保留**（切片丢上下文，不如留原片）；其余（含确认无精华）自动**移入回收目录**，"
         "你只到「精华复核」页翻 A/B 级产物，不用逐条审原片。\n"
@@ -1819,31 +1820,92 @@ def _render_step_by_step(db, cfg, limit: int):
             st.success(f"已重置 {n} 条失败记录。")
             st.rerun()
 
-    # —— Track C · C5 重剪：新口径对**已剪过**的产物回溯生效 ——
-    _n_re_first = jobsmod.count_rehighlight_pending(db, cfg, only_dropped=True)
+    # —— Track C · C5 重剪：只针对「零产物 / 只剩静帧」这两类**症状** ——
+    # 不做「全量重剪」是**取舍**，不是"重剪没用"：全量把版本落后但产物正常的行
+    # 也收进来，量级约是症状行的 5 倍（数小时 vs 数十小时），而收益集中在症状行。
+    # ⚠️ 这里早先写过"同素材同参数重剪必然得到同样结果，白烧机时"——**已被实测
+    #    推翻**（见 docs/自动剪辑方案说明.md §5.3/§5.4）：产物为空是当时那版聚合
+    #    逻辑吃掉的，不是"没东西"。别再拿那条理由把全量入口焊死。
+    _n_re = jobsmod.count_rehighlight_pending(db, cfg, only_dropped=True)
     _n_re_all = jobsmod.count_rehighlight_pending(db, cfg, only_dropped=False)
-    if _n_re_all:
+    if _n_re:
         with st.container(border=True):
-            st.markdown("##### ♻️ 按新口径重剪（删前保全）")
+            st.markdown("##### ♻️ 重新审核「零产物 / 只有静帧」的视频")
             st.caption(
-                "这些视频是用**旧口径**剪的：粗扫看到过目标、却被精扫「否决」后丢弃，"
-                "结果零产物；或者 C 级只留了一张静帧。重剪一次就会补出**可播放的视频**。\n\n"
-                f"第一批（收益最集中）**{_n_re_first}** 条 → 约 "
-                f"{_n_re_first * 6.1 / 3600:.1f} 小时；"
-                f"全量 **{_n_re_all}** 条 → 约 {_n_re_all * 6.1 / 3600:.1f} 小时"
+                "这两类是用**旧口径**剪过的，重剪一次就能补出**可播放的视频**：\n\n"
+                "- **零产物** —— 粗扫明明看到过目标，却被精扫「否决」后丢弃，"
+                "删除后一个字都不留（旧口径的漏检高发区）；\n"
+                "- **C 级只有一张静帧** —— 当时没切视频，光靠一张图没法回放。\n\n"
+                f"共 **{_n_re}** 条 → 约 {_n_re * 6.1 / 3600:.1f} 小时"
                 "（按实测均值 6.1s/条估）。**幂等**：跑过的不会重来，随时可停可续。")
-            _only_first = st.checkbox(
-                "只重剪第一批（零产物 + 只有静帧的）", value=True,
-                key="re_hl_only_first",
-                help="取消勾选则全量重剪到新口径，产物会统一规范，但耗时更长")
-            if st.button(f"♻️ 启动重剪（{_n_re_first if _only_first else _n_re_all} 条，后台）",
+            if st.button(f"♻️ 启动重剪（{_n_re} 条，后台）",
                          use_container_width=True, key="start_rehighlight",
                          disabled=busy or bool(_hl_problems)):
                 cfgmod.save_config(cfg)
                 ok, msg = jobsmod.start_rehighlight(db, cfg, limit=100000,
-                                                     only_dropped=_only_first)
+                                                     only_dropped=True)
                 st.success(msg) if ok else st.warning(msg)
                 st.rerun()
+    elif _n_re_all:
+        st.caption(f"另有 **{_n_re_all}** 条版本落后、**产物正常**的行，暂不重剪 —— "
+                   "它们是取舍掉的那一批（收益集中在上面那批症状行），"
+                   "不是「重剪也白剪」。要全量走 `jobs.start_rehighlight(only_dropped=False)`。")
+
+    # —— 回收目录三堆：手动删除时唯一要看的判据是「这一条能不能删」——
+    # 为什么不按"已剪辑 / 未剪辑"两堆分：need-del 里真正的风险只有一种 ——
+    # 精华还没落袋、却被删了。而"没剪出 A/B"的那一大堆里有六成其实可以闭眼删，
+    # 把危险的那两千多条淹在里面，等于没有保护。所以按保全状态分三堆。
+    _rec = mover.recycle_stats(db, cfg)
+    _n_clip = _rec["in_trash"][mover.STATE_CLIPPED]
+    _n_hold = _rec["in_trash"][mover.STATE_PENDING]
+    _n_plain = _rec["in_trash"][mover.STATE_PLAIN]
+    _n_fix = sum(_rec["to_align"].values())
+    _dir_clip = Path(cfg.get("trash_root") or "") / mover.CLIPPED_SUBDIR
+    _dir_hold = Path(cfg.get("trash_root") or "") / mover.PENDING_SUBDIR
+    if _rec["total"]:
+        with st.container(border=True):
+            st.markdown("##### 🗂 回收目录三堆（按「能不能删」分）")
+            st.caption(
+                f"回收目录里共 **{_rec['total']}** 条原片，按保全状态落成三堆。"
+                "打开回收目录第一层就是这三堆，不用逐条回溯「这个我验过没有」。\n\n"
+                f"| 子档 | 条数 | 怎么处置 |\n|---|---:|---|\n"
+                f"| `{mover.CLIPPED_SUBDIR}` | {_n_clip} | 精华已落袋，**验完产物即可删** |\n"
+                f"| `{mover.PENDING_SUBDIR}` | {_n_hold} | ⚠️ **精华还没落袋，一个都别删** |\n"
+                f"| （留在档位目录） | {_n_plain} | 机器剪过、无 A/B 产物，**可直接删** |\n\n"
+                "**看产物**：产物名以原片名开头（`<原片名>_E01_A_时刻_秒数.mp4`），"
+                "复制原片名到精华目录里搜就能配上。")
+            if _n_hold:
+                st.warning(
+                    f"⚠️ `{mover.PENDING_SUBDIR}` 里还有 **{_n_hold}** 条没剪完 —— "
+                    "它们的精华此刻还在原片里。**先跑完「画面精华剪辑」+「按新口径重剪」，"
+                    "再回来点下面的「对齐子档」**，这一堆会自然清空；"
+                    "在它归零之前，不要清空回收目录。")
+            _c1, _c2, _c3 = st.columns(3)
+            if _c1.button(f"📦 对齐子档（{_n_fix} 条待归位）",
+                          use_container_width=True, key="align_subdirs",
+                          disabled=busy or _n_fix == 0,
+                          help="把每条原片挪到它当前保全状态对应的子档；同盘改名，不复制数据"):
+                with st.spinner("正在同盘搬迁（只改目录，不复制数据）…"):
+                    _ar = mover.align_subdirs(db, cfg)
+                if _ar["failed"]:
+                    st.warning(f"搬入 {_ar['moved']} 条，失败 {_ar['failed']} 条："
+                               + "；".join(_ar["errors"][:3]))
+                else:
+                    _bs = _ar["by_state"]
+                    st.success(
+                        f"已归位 {_ar['moved']} 条（跳过 {_ar['skipped']} 条）"
+                        f" —— {mover.CLIPPED_SUBDIR} {_bs[mover.STATE_CLIPPED]} / "
+                        f"{mover.PENDING_SUBDIR} {_bs[mover.STATE_PENDING]} / "
+                        f"无产物 {_bs[mover.STATE_PLAIN]}")
+                st.rerun()
+            for _col, _tag, _d in ((_c2, mover.CLIPPED_SUBDIR, _dir_clip),
+                                   (_c3, mover.PENDING_SUBDIR, _dir_hold)):
+                if _col.button(f"📂 打开「{_tag}」", use_container_width=True,
+                               key=f"open_subdir_{_tag}"):
+                    if _d.exists():
+                        reveal_in_explorer(str(_d))
+                    else:
+                        st.warning(f"目录还不存在：{_d}（先点左边的「对齐子档」）")
 
     st.divider()
     st.markdown("##### 导出清单")

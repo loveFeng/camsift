@@ -23,6 +23,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# 画面精华产物的「现行口径」版本号。重剪队列按它挑版本落后的行；
+# `mover.is_pending()`（「待保全」子档的判据）也读它 —— 两处必须同一个值，
+# 否则队列说要重剪、回收目录却说"可删"，机主会照着删掉还没保全的原片。
+# mover 直接 import 本常量，selftest 有断言钉住。
+#
+# ⚠️ 换口径要**同时**改三处：这里 / highlighter.HL_VERSION /
+#    config.json 的 highlight.version（剪辑器实际写的是 config 那个值）。
+#    三处漂移的后果是单向且不可见的：config 比这里新 ⇒ 新剪出来的行全部被
+#    判成"版本落后 ⇒ 待保全"，回收目录永远不会归零；反过来 ⇒ 该重剪的不重剪。
+#
+# hlv1 旧 / hlv2 删前保全 / hlv3 检出必留（孤立命中不再被吞，见 highlighter 注释）
+HIGHLIGHT_TARGET_VERSION = "hlv3"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
     id               INTEGER PRIMARY KEY,
@@ -72,7 +85,7 @@ CREATE TABLE IF NOT EXISTS videos (
     vlm_reviewed_at  TEXT,
     final_score      REAL,
 
-    -- L2.5 音频复核（有声事件捞回，见开发计划 3.6）
+    -- L2.5 音频复核（有声事件捞回，见 docs/设计档案-10TB筛选系统.md §3.6）
     audio_checked      INTEGER,   -- 0 未复核 / 1 已复核 / -1 无音轨跳过
     speech_present     INTEGER,   -- VAD 是否检出人声（0/1）
     speech_ratio       REAL,      -- 语音时长占比
@@ -168,7 +181,9 @@ ARCHIVE_COLUMNS: Dict[str, str] = {
 # highlight_sent / highlight_coarse_hits 是「无精华」拆三义的尺子（Track 0）：
 #   没有这两个数，"无精华 3780" 里到底有多少是"真复核过没有"、多少是"压根没跑检测"
 #   根本分不出来 —— 而后者曾把 474 条"粗扫明明看到过目标"的视频静悄悄推进了回收目录。
-# highlight_version 记录产物口径（如 hlv2），驱动重剪队列（Track C · C5）。
+# highlight_version 记录产物口径（hlv1/hlv2/hlv3），驱动重剪队列（Track C · C5）。
+# 它就是本项目的**唯一纠偏机制**：产物口径一变、或发现某个版本曾静默吃掉产物，
+# 就 bump 版本号 —— 已剪过的行版本落后即自动回到重剪队列，且剪完即幂等。
 HIGHLIGHT_COLUMNS: Dict[str, str] = {
     "highlight_at": "TEXT",
     "highlight_count": "INTEGER",
@@ -177,7 +192,7 @@ HIGHLIGHT_COLUMNS: Dict[str, str] = {
     "highlight_error": "TEXT",
     "highlight_sent": "INTEGER",          # 粗扫**实际送检**帧数；0 = 帧差预筛整片跳过
     "highlight_coarse_hits": "INTEGER",   # 粗扫检出命中数，>0 而产物为空 = 信号被丢弃
-    "highlight_version": "TEXT",          # 产物口径版本（hlv1 旧 / hlv2 删前保全）
+    "highlight_version": "TEXT",          # 产物口径版本（hlv1 旧 / hlv2 / hlv3）
     "highlight_best_grade": "TEXT",       # 产物里的最高级别（A>B>C）；仅 C = 纯档案
 }
 
@@ -748,13 +763,20 @@ class Database:
     # 「先剪后删」：人工不再逐条审原片，机器高密度扫完直接产出精华，原片照删。
     # 未移入回收目录的视频直接从源路径（path）读，cut_one 有 trash_path→path 回落。
     def highlight_queue(self, limit: int = 5000,
-                        batch_id: int | None = None) -> List[sqlite3.Row]:
+                        batch_id: int | None = None,
+                        cols: str = "*") -> List[sqlite3.Row]:
         """待剪辑队列：处置候选 + 未剪辑 + 无失败标记。
 
         highlight_error 非空的不进队列 —— 缺文件/解不开这类硬失败重试也没用，
         想重来请用 reset_highlight() 显式清除。
+
+        ⚠️ 被这条谓词排除 ≠ 「不需要保全」。硬失败行和它一样是没落袋的，
+        所以 mover.is_pending() 会把这两类**并起来**看待（见 pending_highlight_ids）。
+
+        cols 只给外部交叉核对用（如 pending_highlight_ids 只要 id）：
+        默认 * 会把 raw_detections / 转写这些大 JSON 一起拉出来。
         """
-        sql = (f"SELECT * FROM videos WHERE ({self._PENDING_OR_TRASHED}) "
+        sql = (f"SELECT {cols} FROM videos WHERE ({self._PENDING_OR_TRASHED}) "
                "AND highlight_at IS NULL AND highlight_error IS NULL")
         args: List[Any] = []
         if batch_id:
@@ -936,8 +958,52 @@ class Database:
                 "WHERE highlight_at IS NOT NULL OR highlight_error IS NOT NULL "
                 "ORDER BY id DESC LIMIT ?", (int(limit or 5000),)).fetchall()
 
+    def recycle_scan_rows(self, limit: int = 200_000,
+                          trashed_only: bool = True) -> List[sqlite3.Row]:
+        """扫回收目录里的原片，取判定**保全状态**所需的最小列集。
+
+        保全状态 = 已剪辑 / 待保全 / 无精华产物（判据在 mover.recycle_state，
+        db 不重复实现）。判定要现算 highlight_clips，所以列里必须带它；
+        还要带 highlight_at / highlight_error / highlight_version /
+        highlight_coarse_hits —— 「待保全」就是照这四列算的。
+
+        绝不 SELECT *：这张表每行还挂着 raw_detections、转写这些大 JSON，
+        全库扫一遍能把内存吃满。
+
+        trashed_only=True（默认）只看 trash_path 非空的行 —— 这正是"回收目录里
+        有什么"的全部；仍在原位、尚未处置的行不用归位（下次 move_one 会落对）。
+        """
+        where = "WHERE trash_path IS NOT NULL" if trashed_only else ""
+        with self.conn() as c:
+            return c.execute(
+                "SELECT id, filename, path, human_decision, trash_path, trash_tier, "
+                "year, rel_dir, batch_id, highlight_at, highlight_error, "
+                "highlight_version, highlight_coarse_hits, highlight_clips "
+                f"FROM videos {where} ORDER BY id ASC LIMIT ?",
+                (int(limit or 200_000),)).fetchall()
+
+    def pending_highlight_ids(self) -> set:
+        """全库「还没剪完」的 id 集合 —— 两条队列 ∪ 硬失败行。
+
+        硬失败行（highlight_error 非空）当前不在任何队列里（要等 reset_highlight()
+        才回去），但对"这条原片还能不能删"来说，它们和排队中的行一样是**没保全**
+        的，所以必须并进来。少并这一类，回收目录就会告诉机主"这些可以删"。
+
+        它的**唯一职责**是给 mover.is_pending() 的行内判断做交叉核对（selftest
+        有断言）。运行时不走这里 —— 批量路径若每条都查一遍队列 SQL 太贵。
+        """
+        ids = {r["id"] for r in self.highlight_queue(limit=10 ** 9, cols="id")}
+        ids |= {r["id"] for r in self.rehighlight_queue(
+            limit=10 ** 9, only_dropped=True,
+            cols="id, highlight_clips, highlight_coarse_hits")}
+        with self.conn() as c:
+            ids |= {r[0] for r in c.execute(
+                "SELECT id FROM videos WHERE highlight_error IS NOT NULL "
+                "AND human_decision IS NOT 'keep'")}
+        return ids
+
     def rehighlight_queue(self, limit: int = 5000,
-                          target_version: str = "hlv2",
+                          target_version: str = HIGHLIGHT_TARGET_VERSION,
                           only_dropped: bool = True,
                           cols: str = "*") -> List[sqlite3.Row]:
         """按产物口径重剪的队列（Track C · C5）。
@@ -948,10 +1014,19 @@ class Database:
         only_dropped=True 时只挑**收益最集中的那一批**：
           - 粗扫看到过目标、最终零产物（D2 受害者，删除后一个字都不留）
           - 只有静帧没有 mp4 的（D1/D4，C 级此前不切视频）
-        这是第一批 868 条的谓词；False 则全量重剪。
+        这是收益最集中的那一批的谓词；False 则全量重剪。
+        （别把"多少条"写进注释 —— 这个数是活的，2026-09-13 实测 1,446 条。）
 
         "有没有 mp4" 用解析后的 clips 判断而不是 SQL 里 LIKE 字符串 ——
         clips 是 JSON，靠 LIKE 匹配引号空格等于把格式当成契约，格式一变静默失效。
+
+        ⚠️ 版本号既是这道门，也是本项目**唯一**的纠偏手段 —— 因为它是"事后按
+        产物状态补救"的唯一入口。踩过的坑：hlv2 时代有两处逻辑会静默吃掉整段
+        产物（见 highlighter.merge_two_levels / merge_events），产出行是
+        `version='hlv2' + clips=[]`，被 `version <> target` 永久挡在队列外，
+        回收目录据此判成"可直接删"（实测 630 条，其中 489 条已在回收目录里）。
+        修法是**修掉那两处 + bump 到 hlv3**，而不是给谓词加症状分支：症状分支
+        会自我循环（重剪后仍零产物 ⇒ 又被选中），bump 版本天生幂等。
         """
         sql = (f"SELECT {cols} FROM videos WHERE highlight_at IS NOT NULL "
                "AND highlight_error IS NULL "
@@ -976,7 +1051,7 @@ class Database:
                     break
         return out
 
-    def count_rehighlight_pending(self, target_version: str = "hlv2",
+    def count_rehighlight_pending(self, target_version: str = HIGHLIGHT_TARGET_VERSION,
                                   only_dropped: bool = True) -> int:
         # 数数只用到 id / clips / coarse_hits —— 别把整行（含转写、raw_detections）
         # 读进内存，重剪队列经常是上千条。

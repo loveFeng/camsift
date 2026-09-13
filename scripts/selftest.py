@@ -318,6 +318,80 @@ def test_no_delete_calls():
         print(f"      发现：{h}")
 
 
+def test_model_verify_sizes():
+    """换模型的两道门必须被 `download_model.verify()` 真的测出来。
+
+    2026-09-12 实测踩到：官方 `yolov8s.onnx` 把 reshape 写死在 640，
+    喂 `fine_size=1280` 会崩在 reshape2_layer；`yolo11s.onnx` 连装载都失败。
+    而当时的 `verify()` **只在 640 上试一次**，这两种模型都会被判成"合格"。
+    """
+    section("模型校验：逐输入尺寸 + 装载（换模型的两道门）")
+    import importlib.util
+
+    import cv2  # verify() 内部 import cv2，拿到的是同一个模块对象，直接改属性即可
+
+    p = Path("scripts/download_model.py")
+    check(p.exists(), "download_model.py 在位")
+    spec = importlib.util.spec_from_file_location("_dm", p)
+    dm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dm)
+
+    real_load = cv2.dnn.readNetFromONNX
+
+    class _Net:
+        def __init__(self, fail_at=None):
+            self.fail_at = fail_at or []
+            self.tried = []
+
+        def setInput(self, blob):
+            self.size = blob.shape[-1]
+            self.tried.append(self.size)
+
+        def forward(self):
+            if self.size in self.fail_at:
+                raise RuntimeError("reshape2: outTotal == inpTotal")
+            import numpy as np
+            return np.zeros((1, 84, 8400), dtype=np.float32)
+
+    try:
+        # A. 装载失败 → 判不合格（yolo11s 那种）
+        def _boom(*a, **k):
+            raise RuntimeError("onnx importer 不支持该图")
+
+        cv2.dnn.readNetFromONNX = _boom
+        check(dm.verify(Path("x.onnx"), sizes=[640]) is False,
+              "装载失败 → 直接判不合格（引不到推理层就不该放行）")
+
+        # B. 只在 1280 崩 → 判不合格，且两个尺寸都试过（yolov8s 那种）
+        net = _Net(fail_at=[1280])
+        cv2.dnn.readNetFromONNX = lambda *a, **k: net
+        check(dm.verify(Path("x.onnx"), sizes=[640, 1280]) is False,
+              "static-640 模型喂 1280 → 判不合格（精扫档会整段挂）")
+        check(net.tried == [640, 1280],
+              f"逐个尺寸都试过，不是只试第一个（试过 {net.tried}）")
+
+        # C. 两档都过 → 合格
+        net2 = _Net()
+        cv2.dnn.readNetFromONNX = lambda *a, **k: net2
+        check(dm.verify(Path("x.onnx"), sizes=[640, 1280]) is True,
+              "两档都能跑 → 合格")
+        check(net2.tried == [640, 1280], "合格判定也走过两个尺寸，不是短路")
+    finally:
+        cv2.dnn.readNetFromONNX = real_load
+
+    # 下载清单：v8.4.0 才有 .onnx（v8.3.0 没有），且 s/m 都在
+    check(set(("yolov8n", "yolov8s", "yolov8m", "yolo11n", "yolo11s", "yolo11m"))
+          <= set(dm.SPECS), "SPECS 覆盖 n/s/m 两族（能直接下候选模型）")
+    u = dm.urls_for("yolov8s")[0]
+    check("v8.4.0" in u and u.endswith("yolov8s.onnx"),
+          f"候选模型地址走 v8.4.0（{u.split('/')[-1]}）")
+
+    # 默认尺寸必须取自**配置里真正会用到的两档**，不能写死
+    src = p.read_text(encoding="utf-8")
+    check("fine_size" in src and "yolo_input_size" in src,
+          "默认校验尺寸取自配置（yolo_input_size + highlight.fine_size），不写死")
+
+
 # --------------------------------------------------------------------------- 9
 def test_config_resilience():
     """配置容错 —— 这是 2026-09-05 上线后真实踩过的坑，必须钉死回归。"""
@@ -495,7 +569,7 @@ def test_audio_review():
     """音频复核层（L2.5）回归：DB 迁移/队列/复核写入/judge 解析/UI 接线。
 
     不依赖 funasr 引擎与模型 —— 只测不碰引擎的分支与数据层逻辑，
-    引擎行为在装好依赖后用真实音频做冒烟（见 docs/开发计划 Phase 2.6）。
+    引擎行为在装好依赖后用真实音频做冒烟（见 docs/设计档案-10TB筛选系统.md §3.6）。
     """
     from src.audioreview import AudioReviewer
     from src.config import DEFAULT_CONFIG
@@ -1279,46 +1353,108 @@ def test_review_jump_nav():
 
 
 def test_coarse_suspect_kept():
-    """Track C · C1（ADR 0006）：粗扫看到、精扫没确认的目标要**降级保留**，不能丢。
+    """Track C · C1（ADR 0006）+ hlv3：粗扫看到的检出要**一律**降级保留，不能丢。
 
     这是本次改动里最值钱的一条 —— 旧口径把这类检出直接扔掉，导致 474 条视频
     "粗扫明明看到过目标、最终零产物"，原片删掉后一个字都不留。
+
+    hlv3 又补了一处：hlv2 里"该窗没被精扫到"还额外要求**有动静**
+    （`c_diffs > fb_thr`）才保留，于是"人坐着、只有小动作"（动静低于阈值）
+    第二次被丢掉 —— 实测 621 条确有真人的画面因此变成零产物。现在**检出必留**，
+    动静只影响"这个窗要不要送去精扫"，不再是"要不要留证"的门槛。
     """
-    section("Track C · C1 粗扫疑似降级保留")
+    section("Track C · C1 粗扫疑似降级保留（hlv3：检出必留）")
     from src.highlighter import LV_CONFIRMED, LV_SUSPECT, merge_two_levels
 
     # 粗扫在 t=10 检出一个人（落在已精扫的窗内），精扫没确认 → f_hits 为空
     c_hits = [{"t": 10.0, "conf": 0.20, "n_person": 1, "max_area": 0.05,
                "level": LV_SUSPECT, "motion_only": False}]
-    c_diffs = [0.0] * 40
     scanned = [(8.0, 12.0)]
 
-    kept, n_down = merge_two_levels(c_hits, [], c_diffs, 4.0, scanned, 0.05,
-                                    fine_on=True, keep_coarse_suspect=True)
+    kept, n_down = merge_two_levels(c_hits, [], scanned, fine_on=True,
+                                    keep_coarse_suspect=True)
     check(n_down == 1 and len(kept) == 1 and kept[0]["level"] == LV_SUSPECT,
           f"粗扫有目标、精扫没确认 ⇒ 降级保留为 C 疑似（{len(kept)} 条）")
 
-    dropped, n_down2 = merge_two_levels(c_hits, [], c_diffs, 4.0, scanned, 0.05,
-                                        fine_on=True, keep_coarse_suspect=False)
+    dropped, n_down2 = merge_two_levels(c_hits, [], scanned, fine_on=True,
+                                        keep_coarse_suspect=False)
     check(not dropped and n_down2 == 0,
           "keep_coarse_suspect=False 退回旧行为（丢弃）—— 开关能一键回到改动前")
 
     # 精扫确认的照常进（升级权还在）
     f_hits = [{"t": 10.0, "conf": 0.31, "n_person": 1, "max_area": 0.08,
                "level": LV_CONFIRMED, "motion_only": False}]
-    conf, _ = merge_two_levels(c_hits, f_hits, c_diffs, 4.0, scanned, 0.05,
-                               fine_on=True, keep_coarse_suspect=True)
+    conf, _ = merge_two_levels(c_hits, f_hits, scanned, fine_on=True,
+                              keep_coarse_suspect=True)
     check(any(h["level"] == LV_CONFIRMED for h in conf),
           "精扫确认的仍按确认级保留（精扫是升级权，不是否决权）")
 
-    # 超预算没精扫到的窗：有动静才留（与旧行为一致）
+    # 超预算没精扫到的窗（t=100 不在 scanned 里）：检出直接留证，不再要求有动静
     far = [{"t": 100.0, "conf": 0.2, "n_person": 1, "max_area": 0.05,
             "level": LV_SUSPECT, "motion_only": False}]
-    d2 = [0.0] * 500
-    d2[400] = 0.09
-    got, _ = merge_two_levels(far, [], d2, 4.0, scanned, 0.05,
-                              fine_on=True, keep_coarse_suspect=True)
-    check(len(got) == 1, "未精扫的窗：有动静 ⇒ 保留为疑似（没复核过不能当否决）")
+    got, _ = merge_two_levels(far, [], scanned, fine_on=True,
+                              keep_coarse_suspect=True)
+    check(len(got) == 1 and got[0]["level"] == LV_SUSPECT,
+          "未精扫的窗：检出照样留证（不再要求「有动静」—— hlv2 的第二个漏点）")
+
+    # 精扫关掉时（fine_on=False）粗扫检出原样返回 —— 合并函数不在这里二次过滤
+    quiet = [{"t": 100.0, "conf": 0.2, "n_person": 1, "max_area": 0.05,
+              "level": LV_SUSPECT, "motion_only": False}]
+    got2, _ = merge_two_levels(quiet, [], scanned, fine_on=False,
+                               keep_coarse_suspect=True)
+    check(len(got2) == 1, "fine_on=False 时粗扫检出原样返回（不丢）")
+
+
+def test_isolated_hit_not_dropped():
+    """hlv3：孤立检出不能被 min_duration 当"一闪而过的误检"吃掉。
+
+    min_duration 的本意是剪掉**纯动静**的碎屑。但 hits 里混着"检测器确实报出了
+    目标"的帧（motion_only=False），一起按时长丢弃会让"人坐着不动、只在一帧被
+    检出"变成**零产物** —— 而零产物在回收目录里等于"可直接删"。实测这类让 621 条
+    确有真人的画面被判成可删，其中 489 条已经在回收目录里。
+    """
+    section("hlv3 · 孤立检出不被 min_duration 吞掉")
+    from src.highlighter import LV_SUSPECT, merge_events
+
+    one = [{"t": 10.0, "conf": 0.2, "n_person": 1, "max_area": 0.05,
+            "level": LV_SUSPECT, "motion_only": False}]
+    ev = merge_events(one, 40.0, min_duration=1.0)
+    check(len(ev) == 1 and ev[0]["grade"] == "C",
+          f"单帧**检出** ⇒ 仍出一个 C 事件（出了 {len(ev)} 个）")
+    check(ev and ev[0]["dur"] >= 1.0,
+          f"前后缓冲把单帧撑成可回放的段（{ev[0]['dur'] if ev else 0}s）")
+
+    mo = [dict(one[0], motion_only=True, conf=0.0)]
+    check(merge_events(mo, 40.0, min_duration=1.0) == [],
+          "单帧**纯动静**仍按旧规则丢弃（不是把时长判断一律取消）")
+
+    m2 = [dict(one[0], motion_only=True), dict(one[0], t=11.0, motion_only=True)]
+    check(merge_events(m2, 40.0, min_duration=5.0) == [],
+          "对纯动静组，min_duration 照样生效（开关没被废掉）")
+
+
+def test_hl_version_single_source():
+    """hlv 版本号必须只有一个值 —— 三处真源漂移会让回收目录永远归不了零。
+
+    剪辑器**写库**用的是 `config.highlight.version`（或 DEFAULT_CONFIG 兜底），
+    重剪队列与「待保全」判据读的是 `db.HIGHLIGHT_TARGET_VERSION`，
+    而 `highlighter.HL_VERSION` 是代码里的默认值。三者不一致的后果是单向且
+    不可见的：config 比 db 新 ⇒ 每条新剪的行都被判"版本落后 ⇒ 待保全"，
+    回收目录永不归零；db 比 config 新 ⇒ 该重剪的行不重剪，原片删后精华永失。
+    """
+    section("hlv 版本号单一真源（四处必须相等）")
+    from src.config import DEFAULT_CONFIG, load_config
+    from src.highlighter import HL_VERSION
+    import src.db as DBmod
+
+    got = {
+        "highlighter.HL_VERSION": HL_VERSION,
+        "db.HIGHLIGHT_TARGET_VERSION": DBmod.HIGHLIGHT_TARGET_VERSION,
+        "config.json": str((load_config().get("highlight") or {}).get("version") or ""),
+        "DEFAULT_CONFIG": str(DEFAULT_CONFIG["highlight"].get("version") or ""),
+    }
+    vals = set(got.values())
+    check(len(vals) == 1, f"四处版本号一致（实测 {got}）")
 
 
 def test_c_cut_mp4():
@@ -1349,6 +1485,66 @@ def test_c_cut_mp4():
           "代表帧时刻落在段内且互不重复")
     check(HighlightCutter._thumb_times(ev, 1) == [22.0],
           "thumb_per_clip=1 时行为不变（A/B 级不受影响）")
+
+
+def test_coarse_zero_hits_no_crash():
+    """粗扫零命中必须被记成「无精华」，绝不抛异常 —— 否则是静默漏检。
+
+    真实事故（2026-09-12 实测）：cut_one 把 `scanned` 定义在 `if fine_on and c_hits`
+    的**里面**，而合并两级结果时无条件引用它。而「粗扫零命中」恰恰是最常见的一类
+    （帧差预筛跳过 + 确实没有目标）。于是这些片段不是被记成"无精华"，而是抛
+    UnboundLocalError → mark_highlight_error → 被踢出队列。
+
+    为什么这条比普通 bug 贵：`highlight_queue` 与 `rehighlight_queue` **都**要求
+    `highlight_error IS NULL`，所以一旦踩中，这条视频既不进正常队列、也不进重剪
+    队列 —— 它从两边的视野里同时消失，而且库里看起来只是"失败了几条"。
+    实测 1,382 条就是这样卡死的。
+    """
+    section("粗扫零命中：记成无精华，不抛 UnboundLocalError")
+    import src.highlighter as HL
+
+    d = Path(tempfile.mkdtemp(prefix="vs_zero_"))
+    cutter = object.__new__(HL.HighlightCutter)     # 跳过 __init__（不碰 ffmpeg/模型）
+    cutter.cfg = {"highlight": {"auto_dispose": False}}
+    cutter.h = {"fine_enabled": True, "c_cut_mp4": True, "keep_person": True,
+                "version": HL.HL_VERSION}
+    cutter.ffmpeg = cutter.ffprobe = "ffmpeg"
+    cutter.work_dir = d
+    cutter.coarse = cutter.fine = None              # 没有检测器 → fine_on=False
+
+    real_probe = HL.probe_av
+    real_extract = HL.HighlightCutter._extract
+    real_scan = HL.HighlightCutter._scan
+    HL.probe_av = lambda p, f, timeout=30: {"duration": 42.0, "fps": 15.0,
+                                            "has_audio": True}
+    HL.HighlightCutter._extract = (
+        lambda self, src, out, fps, width, dur=None, start=0.0: [Path("f_00001.jpg")])
+    HL.HighlightCutter._scan = (
+        lambda self, frames, fps, t0, dur, det, conf, pre, keep, fb: ([], [0.0], 0))
+    try:
+        srcf = d / "20150619095035_010.mp4"
+        srcf.write_bytes(b"v")
+        row = {"id": 1, "path": str(srcf), "filename": srcf.name, "year": "2015",
+               "rel_dir": "", "duration_sec": 42.0, "batch_id": None,
+               "human_decision": None, "duration": 42.0}
+        r = cutter.cut_one(row, d / "hl", "t", log=None)
+        check(r.get("ok") is True and r.get("clips") == [],
+              f"零命中 → ok=True / clips=[]（不抛异常；{r.get('reason') or r.get('note')}）")
+        check((r.get("stats") or {}).get("coarse_sent") == 0,
+              "统计留下 coarse_sent=0（区分「预筛跳过」与「确实没有」的唯一依据）")
+        # 源码级双保险：scanned 的初始化必须在 if 之外。
+        # 注意要在 cut_one 的**函数体切片**里找 `if fine_on and c_hits:` ——
+        # 全文找会先命中 merge_two_levels 里同名的那个 if（我第一次就这么写错了）。
+        src = Path("src/highlighter.py").read_text(encoding="utf-8")
+        body = src[src.index("def cut_one"):src.index("def run_batch")]
+        head = body[:body.index("if fine_on and c_hits:")]
+        check("scanned: List[Tuple[float, float]] = []" in head[-400:],
+              "scanned 在 `if fine_on and c_hits` **之外**初始化（回归钉死）")
+    finally:
+        HL.probe_av = real_probe
+        HL.HighlightCutter._extract = real_extract
+        HL.HighlightCutter._scan = real_scan
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_c_not_in_review():
@@ -1492,6 +1688,245 @@ def test_rehighlight_idempotent():
           "any_running 纳入重剪任务（它与剪辑抢同一批源文件，不能并发）")
 
 
+def test_recycle_subdirs():
+    """回收子档三态：已剪辑 / 待保全 / 无精华产物。
+
+    为什么值得钉死：回收目录的终点是**人工手动删除**，打开文件夹时唯一要回答的
+    问题是"这一条我现在能删吗"。判错了会**静默**把"精华还没落袋的"混进
+    "可以整批删的"里 —— 代价是产物都没生成，原片已经被删了，不可逆。
+    所以四样都要钉：三态判据、落点层级、**旧快照不得污染判据**、
+    以及"行内判断"与"剪辑队列口径"必须一致（两套判据漂了就是下一个事故）。
+    """
+    section("回收子档三态（已剪辑 / 待保全 / 无精华产物）")
+    import src.mover as M
+    import src.db as DBmod
+
+    # ---------- A. 判据：has_ab_clip ----------
+    d0 = Path(tempfile.mkdtemp(prefix="vs_clip_"))
+    try:
+        real = d0 / "a.mp4"
+        real.write_bytes(b"x")
+        gone = d0 / "b.mp4"                     # 故意不创建
+        check(M.has_ab_clip([{"grade": "A", "file": str(real)}]),
+              "A 级 + 产物存在 → 算「已剪辑」")
+        check(M.has_ab_clip([{"grade": "B", "file": str(real)}]), "B 级同样算")
+        check(not M.has_ab_clip([{"grade": "C", "file": str(real)}]),
+              "只有 C 级 → 不算（C 是档案不是待办，不进人工审核队列）")
+        check(not M.has_ab_clip([{"grade": "A", "file": str(gone)}]),
+              "A 级但产物文件已不在 → 不算（标记不能给无法兑现的承诺）")
+        check(not M.has_ab_clip([{"grade": "A", "file": None}]),
+              "A 级但当时切段失败（file=None，只剩静帧）→ 不算")
+        check(not M.has_ab_clip([]) and not M.has_ab_clip(None), "零产物 → 不算")
+        check(M.has_ab_clip([{"grade": "A", "file": str(gone)}], verify=False),
+              "verify=False 只认记录、不碰文件系统（给 UI 现状统计用）")
+        check(M.ab_clip_files([{"grade": "A", "file": "x"}, {"grade": "C", "file": "y"},
+                               {"grade": "B", "file": None}]) == [Path("x")],
+              "ab_clip_files：只取 A/B 且真切出 mp4 的（C 与 file=None 排除）")
+    finally:
+        shutil.rmtree(d0, ignore_errors=True)
+
+    # ---------- B. 判据：current_subdir 反解 ----------
+    check(M.current_subdir(r"G:\need-del\已剪辑\A_x\2024\f.mp4", r"G:\need-del")
+          == M.CLIPPED_SUBDIR, "current_subdir：认出子档层")
+    check(M.current_subdir(r"G:\need-del\A_x\2024\f.mp4", r"G:\need-del") == "",
+          "current_subdir：档位目录下 = 无子档")
+    check(M.current_subdir(r"G:\need-del\A_x\2024\已剪辑\f.mp4", r"G:\need-del") == "",
+          "current_subdir：只看紧邻回收根那层（原目录树里的同名文件夹不算子档）")
+    check(M.SUBDIR_BY_STATE[M.STATE_PLAIN] == "",
+          "plain 不进子档（存量 8 千个文件已在档位目录下，没必要全搬一层）")
+
+    # ---------- C. 落点三态 + 存量对齐 ----------
+    d, db, bid, ids = _tmp_db(6)
+    try:
+        cfg = {"work_dir": str(d), "trash_root": str(d / "need-del")}
+        rp = len(Path(cfg["trash_root"]).parts)
+        hl = d / "hl"
+        hl.mkdir()
+        clip_a = hl / "v_E01_A_120000_9s.mp4"
+        clip_a.write_bytes(b"a")
+        clip_c = hl / "v_E01_C_120000_9s.mp4"
+        clip_c.write_bytes(b"c")
+
+        def _put(vid):
+            p = Path(db.get_video(vid)["path"])
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"v")
+            return dict(db.get_video(vid))
+
+        # ① 没剪过 → 批量放行（不走剪辑链路）→ 待保全
+        r0 = _put(ids[0])
+        ok0, dst0 = M.move_one(db, r0, cfg, "A")
+        check(ok0 and Path(dst0).parts[rp] == M.PENDING_SUBDIR,
+              f"没剪过的原片 → 落「{M.PENDING_SUBDIR}」（不许混进可删堆）")
+
+        # ② 剪辑链路：刚剪完、只有 C 级。传进去的 row 是**剪辑前的旧快照**
+        #    （highlight_at 还是 NULL）—— 必须回库取新鲜行，否则误判成「待保全」
+        r1 = _put(ids[1])
+        db.mark_highlight(ids[1], "t", 1, 9.0,
+                          [{"grade": "C", "file": str(clip_c)}],
+                          sent=30, coarse_hits=3, version=M.HIGHLIGHT_TARGET_VERSION)
+        ok1, dst1 = M.move_one(db, r1, cfg, "B",
+                               clips=[{"grade": "C", "file": str(clip_c)}])
+        check(ok1 and M.current_subdir(dst1, cfg["trash_root"]) == "",
+              "刚剪完只有 C 级 → 落档位目录（旧快照的 highlight_at 是 NULL，"
+              "不回库取新鲜行就会错放进待保全）")
+
+        # ③ 剪出 A 级 → 已剪辑
+        r2 = _put(ids[2])
+        db.mark_highlight(ids[2], "t", 1, 9.0,
+                          [{"grade": "A", "file": str(clip_a)}],
+                          sent=30, coarse_hits=5, version=M.HIGHLIGHT_TARGET_VERSION)
+        ok2, dst2 = M.move_one(db, r2, cfg, "B",
+                               clips=[{"grade": "A", "file": str(clip_a)}])
+        check(ok2 and Path(dst2).parts[rp] == M.CLIPPED_SUBDIR,
+              f"剪出 A 级 → 落「{M.CLIPPED_SUBDIR}」")
+        check(Path(dst2).parts[rp + 1] == M.TIER_NAMES["B"],
+              "子档下仍保留原回收档位（两个正交维度都在路径里）")
+        r2b = db.get_video(ids[2])
+        check(r2b["trash_path"] == dst2 and r2b["trash_tier"] == "B"
+              and r2b["human_decision"] == "trash",
+              "trash_path 记的是子档内真实落点，档位不变")
+        check(ids[2] in {r["id"] for r in db.list_moved()},
+              "子档内的文件仍出现在「可撤销移动」队列（撤销能力没被落点破坏）")
+
+        # ④ 存量：先在档位目录，之后补上 A 级产物记录（hlv1）→ 对齐到已剪辑
+        r3 = _put(ids[3])
+        M.move_one(db, r3, cfg, "A", state=M.STATE_PLAIN)
+        db.mark_highlight(ids[3], "t", 1, 9.0,
+                          [{"grade": "A", "file": str(clip_a)}],
+                          sent=30, coarse_hits=5, version="hlv1")
+        before3 = db.get_video(ids[3])["trash_path"]
+        ok3, dst3 = M.align_one(db, dict(db.get_video(ids[3])), cfg)
+        check(ok3 and M.current_subdir(dst3, cfg["trash_root"]) == M.CLIPPED_SUBDIR
+              and Path(dst3).exists() and not Path(before3).exists(),
+              "align_one：存量文件搬进子档（同盘 move，原位置已无此文件）")
+        r3b = db.get_video(ids[3])
+        check(r3b["trash_tier"] == "A" and r3b["trash_path"] == dst3
+              and r3b["human_decision"] == "trash",
+              "存量搬迁保留档位与处置结论，只更新 trash_path")
+
+        # ⑤ 硬失败 → 待保全（它不在任何队列里，但同样"没保全"）
+        r4 = _put(ids[4])
+        M.move_one(db, r4, cfg, "B", state=M.STATE_PLAIN)
+        db.mark_highlight_error(ids[4], "抽帧失败（测试用）")
+        ok4, dst4 = M.align_one(db, dict(db.get_video(ids[4])), cfg)
+        check(ok4 and M.current_subdir(dst4, cfg["trash_root"]) == M.PENDING_SUBDIR,
+              f"硬失败的行 → 落「{M.PENDING_SUBDIR}」"
+              "（队列不收它，但它一样是没落袋的）")
+
+        # ⑥ 粗扫看到过却零产物（hlv1，版本落后）→ 待保全
+        r5 = _put(ids[5])
+        M.move_one(db, r5, cfg, "A", state=M.STATE_PLAIN)
+        db.mark_highlight(ids[5], "t", 0, 0.0, [], sent=30, coarse_hits=7,
+                          version="hlv1")
+        ok5, dst5 = M.align_one(db, dict(db.get_video(ids[5])), cfg)
+        check(ok5 and M.current_subdir(dst5, cfg["trash_root"]) == M.PENDING_SUBDIR,
+              "粗扫看到过却零产物（版本落后）→ 待保全（重剪队列收着它）")
+
+        # ⑦ 幂等 + 反向：补剪出 A/B 之后，待保全 → 已剪辑
+        okx, msgx = M.align_one(db, dict(db.get_video(ids[5])), cfg)
+        check(not okx and "已在" in msgx, f"幂等：已在正确子档内直接跳过（{msgx}）")
+        db.mark_highlight(ids[5], "t2", 1, 9.0,
+                          [{"grade": "B", "file": str(clip_a)}],
+                          sent=30, coarse_hits=7,
+                          version=M.HIGHLIGHT_TARGET_VERSION)
+        ok6, dst6 = M.align_one(db, dict(db.get_video(ids[5])), cfg)
+        check(ok6 and M.current_subdir(dst6, cfg["trash_root"]) == M.CLIPPED_SUBDIR,
+              "补剪出 A/B 后：待保全 → 已剪辑（对齐是双向的，跑完保全再对齐一次即可）")
+
+        with db.conn() as _c:
+            act = _c.execute(
+                "SELECT COUNT(*) FROM action_log WHERE video_id=? AND action='rehome'",
+                (ids[3],)).fetchone()[0]
+        check(act == 1, "存量搬迁写 action_log（可追溯）")
+
+        # ⑧ 统计（三态计数 + 该不该再搬）
+        st = M.recycle_stats(db, cfg, verify=True)
+        check(st["total"] == 6 and st["in_trash"][M.STATE_CLIPPED] == 3
+              and st["in_trash"][M.STATE_PENDING] == 2
+              and st["in_trash"][M.STATE_PLAIN] == 1,
+              f"recycle_stats 三态计数（{st['in_trash']}）")
+        check(sum(st["to_align"].values()) == 0,
+              f"全部就位后 to_align 归零（{st['to_align']}）")
+
+        # ⑨ 撤销必须依然可用 —— 子档只是换了个子目录，不该破坏回退
+        rr = db.get_video(ids[4])
+        ok7, _ = M.undo_move(db, rr)
+        rr = db.get_video(ids[4])
+        check(ok7 and Path(rr["path"]).exists() and rr["trash_path"] is None,
+              "搬迁后的文件仍可撤销回原位（trash_path 不变量未被破坏）")
+
+        # ⑩ 反漂移：**行内判断必须与剪辑队列口径一致**
+        # 这是本模块最容易出事的地方 —— 两套判据一旦漂了，UI 会说"可删"而
+        # 队列还在排重剪，机主照着删就把没落袋的精华删了。
+        pids = db.pending_highlight_ids()
+        bad = [r["id"] for r in db.recycle_scan_rows()
+               if M.is_pending(r) != (r["id"] in pids)]
+        check(not bad, f"行内判断 == 队列口径（不一致的 id：{bad}）")
+        check(M.HIGHLIGHT_TARGET_VERSION == DBmod.HIGHLIGHT_TARGET_VERSION,
+              "mover 与 db 共用同一个目标版本号常量")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ---------- D. UI / 脚本接线（源码级，防改后端忘接前面） ----------
+    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+    check("mover.recycle_stats(db, cfg)" in ui_src
+          and "mover.align_subdirs(db, cfg)" in ui_src,
+          "UI：设置页有「回收目录三堆」卡（现状 + 一键对齐）")
+    check("mover.PENDING_SUBDIR" in ui_src and "mover.CLIPPED_SUBDIR" in ui_src,
+          "UI：子档名取自 mover 常量（不写死字面量，改名不会漂）")
+    check("re_hl_only_first" not in ui_src,
+          "UI：不给「全量重剪」勾选框 —— UI 只收症状行；"
+          "要全量走 jobs.start_rehighlight(only_dropped=False)")
+    ah = Path("scripts/audit_highlight.py").read_text(encoding="utf-8")
+    check("HIGHLIGHT_TARGET_VERSION" in ah and "recycle_state" in ah,
+          "产物体检脚本复用 db 的目标版本与 mover 的三态判据（不另立口径）")
+    check("版本已是目标值却仍为空" in ah,
+          "体检脚本单独标出「版本已是目标值却产物为空」的可疑行（这类只能靠 bump 版本号纠偏）")
+    m_src = Path("src/mover.py").read_text(encoding="utf-8")
+    check('fresh = db.get_video(row["id"])' in m_src,
+          "move_one 回库取新鲜行判状态（不信调用方手里那份剪辑前快照）")
+    alb = Path("scripts/align_subdirs.py").read_text(encoding="utf-8")
+    check("--apply" in alb and "dry-run" in alb.lower(),
+          "存量对齐脚本默认只出计划，--apply 才动手")
+    check("mover.recycle_state" in alb and "def recycle_state(" in m_src
+          and "def is_pending(" in m_src,
+          "对齐脚本复用 mover 的判据，不另写一套")
+
+
+def test_audit_highlight_states():
+    """产物体检报告里的"三态"列**只统计已在回收目录的行**。
+
+    三态判据属于回收目录语境（回答"这一条现在能不能删"），对全库行套用会把
+    "还没剪过"报成"待保全"。2026-09-13 实测：789 条 `human_decision='keep'`
+    里有 392 条从未剪过，全都会被误报 —— 这就是要按 `trash_path` 先过滤的原因。
+    症状诊断（`symptom_of`）反过来必须**看全库**，两件事不能混。
+    """
+    section("产物体检：三态列只在回收目录语境里统计")
+    import importlib.util
+
+    p = Path("scripts/audit_highlight.py")
+    check(p.exists(), "audit_highlight.py 在位")
+    spec = importlib.util.spec_from_file_location("_ah", p)
+    ah = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ah)          # 顺带验语法/导入
+
+    rows = [
+        {"id": 1, "trash_path": r"G:\need-del\A_高置信_可批量删除\2015\x.mp4",
+         "highlight_at": None},                                  # 在回收目录、没剪过
+        {"id": 2, "trash_path": None, "highlight_at": None},      # 没搬进回收目录
+        {"id": 3, "trash_path": "", "highlight_at": None},        # 空串也算没搬
+    ]
+    st = ah.recycle_states(rows)
+    check(st == {mover.STATE_PENDING: 1},
+          f"未搬进回收目录的行进不了三态列（得到 {st}）")
+
+    check(ah.symptom_of({"highlight_at": None}) == "没剪过"
+          and ah.symptom_of({"highlight_at": 1, "highlight_clips": "[]",
+                             "highlight_coarse_hits": 5}) == "零产物+有命中",
+          "symptom_of 仍对全库行生效（症状诊断与回收语境是两件事）")
+
+
 def test_highlight_batch():
     """L2.8 批处理：队列元素是 sqlite3.Row（没有 .get）时不得崩溃。
 
@@ -1547,7 +1982,7 @@ def test_highlight_batch():
         # 只验证「批处理记账 + 自动处置」的编排逻辑本身。
         from src import mover as M
         _real_move_one, _real_decide = M.move_one, M.decide_tier
-        M.move_one = lambda db, row, cfg, tier, log=None: (True, "fake-moved")
+        M.move_one = lambda db, row, cfg, tier, log=None, clips=None: (True, "fake-moved")
         M.decide_tier = lambda row, cfg: "A"
         try:
             res = _Cutter(cfg).run_batch(_DB(), log=lambda s: None)
@@ -1681,11 +2116,14 @@ def test_adr0001_cut_then_delete():
 
     # ---------- C. _dispose_one 各分支（mover 原语打桩） ----------
     from src import mover as M
-    calls = {"move": 0, "undo": 0, "keep": 0}
+    calls = {"move": 0, "undo": 0, "keep": 0, "move_clips": None}
     _real = (M.move_one, M.undo_move, M.decide_tier)
 
-    def _fake_move(db, row, cfg, tier, log=None):
+    def _fake_move(db, row, cfg, tier, log=None, clips=None):
+        # clips 是「已剪辑」子档的落点依据 —— 处置链路必须把**本次新剪出**的产物
+        # 传下来（row 里那份是剪辑前的旧快照）。这里顺带把它记下来做断言。
         calls["move"] += 1
+        calls["move_clips"] = clips
         return True, "fake-moved"
 
     def _fake_undo(db, row, log=None):
@@ -1717,8 +2155,8 @@ def test_adr0001_cut_then_delete():
             base.update(kw)
             return base
 
-        def _r(ratio, ok=True):
-            return {"ok": ok, "kept_ratio": ratio}
+        def _r(ratio, ok=True, clips=None):
+            return {"ok": ok, "kept_ratio": ratio, "clips": clips or []}
 
         c = _cut()
         check(c._dispose_one(dbx, _row(), _r(0.5, ok=False))[0] == "skip",
@@ -1753,6 +2191,15 @@ def test_adr0001_cut_then_delete():
         act, note = c._dispose_one(dbx, _row(human_decision="trash"), _r(0.85))
         check(act == "undo_keep" and calls["undo"] == 1,
               f"dispose：已放行但整片有内容 → 撤销移动捞回（{note}）")
+
+        # 落点依据必须是**本次新剪出**的 clips：row 里那份是剪辑前的旧快照，
+        # 拿它判断会把刚剪出 A/B 的原片错放进普通档位（「已剪辑」标记就废了）
+        calls["move"] = 0
+        _clip = [{"grade": "A", "file": "x.mp4", "dur": 9.0}]
+        act, _ = _cut(audio_on=True)._dispose_one(
+            dbx, _row(has_audio=0, audio_checked=1), _r(0.1, clips=_clip))
+        check(act == "moved" and calls["move_clips"] == _clip,
+              "dispose：把本次新剪出的 clips 透传给 move_one（决定「已剪辑」落点）")
 
         calls["move"] = 0
         act, note = c._dispose_one(dbx, _row(human_decision="trash"), _r(0.1))
@@ -1963,6 +2410,7 @@ def main() -> int:
     test_jobs()
     test_hotkey_binding()
     test_no_delete_calls()
+    test_model_verify_sizes()
     test_config_resilience()
     test_grid_select_all()
     test_audio_review()
@@ -1973,10 +2421,15 @@ def main() -> int:
     test_review_queue_selfheal()
     test_review_jump_nav()
     test_coarse_suspect_kept()
+    test_isolated_hit_not_dropped()
+    test_hl_version_single_source()
     test_c_cut_mp4()
+    test_coarse_zero_hits_no_crash()
     test_c_not_in_review()
     test_no_clip_split()
     test_rehighlight_idempotent()
+    test_recycle_subdirs()
+    test_audit_highlight_states()
     test_highlight_batch()
     test_adr0001_cut_then_delete()
     test_adr0004_pipeline()

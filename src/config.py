@@ -174,7 +174,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # ---- 删前保全（Track C · ADR 0006）----
         # 定位：精华剪辑是"原片被删之前的最后一道保全"，所以偏置是**宁可多留**。
         # 这三个开关是本次保全量的主控，出问题一键退回旧行为。
-        "version": "hlv2",             # 产物口径版本；已剪过的行版本落后即进重剪队列
+        # ⚠️ 改这个值必须同步 highlighter.HL_VERSION 与 db.HIGHLIGHT_TARGET_VERSION
+        #    （selftest 有断言钉住三者相等；漂移会让回收目录永远归不了零）
+        "version": "hlv3",             # 产物口径版本；已剪过的行版本落后即进重剪队列
         "keep_coarse_suspect": True,   # 粗扫看到、精扫没确认 ⇒ 降级保留为 C（不再丢弃）
                                        # 关掉即回到旧行为：这类信号直接消失（D2 的成因）
         "c_cut_mp4": True,             # C 级也切可播放 mp4（关掉则只留代表帧）
