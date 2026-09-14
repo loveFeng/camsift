@@ -52,9 +52,10 @@ def main() -> int:
         print("❌ 页面上没有「一键执行」区块标题")
         return 1
 
-    # 六个阶段开关 + 关键输入框是否都在
+    # 七个阶段开关 + 关键输入框是否都在
     cbs = [c.label for c in at.checkbox]
-    need_cb = ["扫描元数据", "AI 分析", "音频复核", "语音档案归档", "批量放行", "画面精华剪辑"]
+    need_cb = ["扫描元数据", "AI 分析", "音频复核", "语音档案归档", "批量放行",
+               "画面精华剪辑", "回收目录三堆对齐"]
     miss_cb = [c for c in need_cb if c not in cbs]
     if miss_cb:
         print(f"❌ 阶段开关缺失：{miss_cb}")
@@ -104,7 +105,7 @@ def main() -> int:
             return 1
         print("审核台「跳到分数 ≥」回调：无异常")
 
-    print("✅ UI 渲染冒烟通过：整页无异常，一键执行区、六个阶段开关、跳转筛选控件在位")
+    print("✅ UI 渲染冒烟通过：整页无异常，一键执行区、七个阶段开关、跳转筛选控件在位")
     return 0
 
 

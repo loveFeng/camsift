@@ -278,7 +278,7 @@ def job_panel(job, title: str, key: str):
     if job.running:
         if job.stage_count:
             # 一键执行：进度条说的是"当前这个阶段"，所以阶段序号必须显式写出来，
-            # 否则用户看到 3/6 的进度条会误以为整条链才跑了 3/6。
+            # 否则用户看到 3/7 的进度条会误以为整条链才跑了 3/7。
             st.caption(f"阶段 **{job.stage_index}/{job.stage_count}**："
                        f"{job.stage_name or '准备中…'}")
         c1, c2, c3, c4 = st.columns([2.6, 1, 1.1, 1.7])
@@ -1447,11 +1447,12 @@ def _render_pipeline(db, cfg) -> int:
     st.markdown("##### ⚡ 一键执行")
     st.caption(
         "把 **扫描 → AI 分析 → 音频复核 → 语音归档 → 批量放行 → 画面精华剪辑"
-        "（含自动处置）** 串成一条链，参数在这里一次配好、点一下跑完，"
-        "终点是「回收目录就绪」，剩下的只有手动清空回收目录。\n\n"
+        "（含自动处置）→ 回收目录三堆对齐** 串成一条链，参数在这里一次配好、"
+        "点一下跑完，终点是「回收目录就绪」，剩下的只有手动清空回收目录。\n\n"
         "顺序由依赖决定：分析先于音频复核/剪辑（它们的队列只认已判定的片段）、"
         "音频复核先于语音归档（归档吃的是复核产物）、**放行必须排在剪辑之前**"
-        "（剪辑的自动处置会搬走未处置候选，反序放行就成了空操作）。")
+        "（剪辑的自动处置会搬走未处置候选，反序放行就成了空操作）、"
+        "**三堆对齐必须排在最后**（它按保全状态归档，早于剪辑跑等于白搬一次）。")
 
     p = cfg.setdefault("pipeline", {})
     stages = p.setdefault("stages", {})
@@ -1495,22 +1496,24 @@ def _render_pipeline(db, cfg) -> int:
 
     st.caption("阶段开关（默认全开；去掉勾选就跳过那一步，之后的阶段照跑）：")
     on: Dict[str, bool] = {}
-    for row in (jobsmod.PIPELINE_STAGES[0:3], jobsmod.PIPELINE_STAGES[3:6]):
-        cols = st.columns(3)
+    for row in (jobsmod.PIPELINE_STAGES[0:4], jobsmod.PIPELINE_STAGES[4:8]):
+        cols = st.columns(4)
         for c, (key, name) in zip(cols, row):
             on[key] = c.checkbox(name, value=bool(stages.get(key, True)),
                                  key=f"pipe_st_{key}")
 
     # 待办概览：这些数字就是"点一下会发生什么"
-    _m = st.columns(6)
+    _m = st.columns(7)
     _m[0].metric("待分析", _count_analyze_todo(db))
     _m[1].metric("待音频复核", db.count_audio_pending())
     _m[2].metric("待归档", db.count_archive_pending())
     _m[3].metric("待放行", db.count_release(*mover.release_params(cfg)))
     _m[4].metric("待剪辑", db.count_highlight_pending())
     _m[5].metric("待审核", db.count_review_queue())
+    _m[6].metric("待归位", sum(mover.recycle_stats(db, cfg)["to_align"].values()))
     st.caption("「待分析」= 已导入但没跑过判定的；「待放行」= 判删候选里没有任何人物信号的"
-               "（动物/车辆不拦）。放行不清空剪辑队列 —— 它们仍会被重扫兜底。")
+               "（动物/车辆不拦）。放行不清空剪辑队列 —— 它们仍会被重扫兜底。"
+               "「待归位」= 回收目录里没待在正确子档的条数（对齐阶段会搬它们）。")
 
     boxes = {"src": src, "trash": trash, "work": work, "model": model, "arch": arch,
              "hldir": hldir, "thr": thr, "nfr": nfr, "yolo_en": yolo_en,

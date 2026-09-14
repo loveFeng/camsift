@@ -2280,12 +2280,15 @@ def test_adr0004_pipeline():
 
     # ---------- A. 阶段顺序由依赖决定，不是随意排的 ----------
     keys = [k for k, _ in J.PIPELINE_STAGES]
-    check(keys == ["scan", "analyze", "audio", "archive", "release", "highlight"],
+    check(keys == ["scan", "analyze", "audio", "archive", "release", "highlight",
+                   "align"],
           f"阶段顺序：{keys}")
     check(keys.index("analyze") < keys.index("audio") < keys.index("archive"),
           "依赖：分析先于音频复核，音频复核先于语音归档")
     check(keys.index("release") < keys.index("highlight"),
           "依赖：放行必须在剪辑之前（反序会被剪辑的自动处置清空成空操作）")
+    check(keys.index("highlight") < keys.index("align"),
+          "依赖：三堆对齐必须在剪辑之后（对齐按保全状态归档，早于剪辑跑等于白搬）")
 
     # ---------- B. 前置总检：缺什么拦什么，缺一个就拒绝启动 ----------
     base = copy.deepcopy(DEFAULT_CONFIG)
@@ -2311,7 +2314,8 @@ def test_adr0004_pipeline():
     # ---------- C. 阶段调度：顺序 / 跳过 / 失败即停 / 停止 ----------
     cfg = {"work_dir": "."}
     opts = {"stages": {"scan": True, "analyze": True, "audio": True,
-                       "archive": False, "release": True, "highlight": True},
+                       "archive": False, "release": True, "highlight": True,
+                       "align": True},
             "scan_limit": 10, "scan_with_audio": False, "stage_limit": 100}
     real_stage = J._run_stage
     calls = []
@@ -2327,10 +2331,10 @@ def test_adr0004_pipeline():
         J._run_pipeline(job, None, cfg, opts)
     finally:
         J._run_stage = real_stage
-    check(calls == ["scan", "analyze", "audio", "release", "highlight"],
+    check(calls == ["scan", "analyze", "audio", "release", "highlight", "align"],
           f"调度：未勾选的 archive 被跳过，其余按依赖顺序跑（{calls}）")
-    check(job.stage_count == 5 and job.stage_index == 5,
-          f"面板阶段计数：{job.stage_index}/{job.stage_count}")
+    check(job.stage_count == 6 and job.stage_index == 6,
+          f"面板阶段计数：{job.stage_index}/{job.stage_count}（7 阶段里 archive 未勾 → 分母 6）")
     check([s["key"] for s in job.result["stages"]] == calls
           and not job.result["aborted"],
           "结果：逐阶段摘要齐全、未标记中断")
@@ -2402,10 +2406,16 @@ def test_adr0004_pipeline():
           "UI：原分散段落折叠进「高级 / 分步」")
     check("{job.stage_index}/{job.stage_count}" in ui_src
           and "逐阶段列结果" in ui_src,
-          "UI：面板显示当前阶段与逐阶段结果（否则 3/6 的进度条会被误读）")
+          "UI：面板显示当前阶段与逐阶段结果（否则 3/7 的进度条会被误读）")
     check("_PIPELINE = \"pipeline\"" in jobs_src and "def start_pipeline" in jobs_src
           and "def pipeline_precheck" in jobs_src and "PIPELINE_STAGES" in jobs_src,
           "jobs：流水线任务类型 / 前置检查 / 启动入口齐备")
+    check('if key == "align":' in jobs_src and "align_subdirs" in jobs_src
+          and 'st.get("align", True)' in jobs_src,
+          "jobs：三堆对齐阶段复用 mover.align_subdirs（与手点「对齐子档」同一入口），"
+          "且前置检查把 align 纳入 trash_root 硬条件")
+    check("待归位" in ui_src and "PIPELINE_STAGES[0:4]" in ui_src,
+          "UI：一键执行区显示「待归位」指标、七个阶段开关两行排布（4+3）")
 
 
 def main() -> int:

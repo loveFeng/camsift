@@ -41,6 +41,8 @@ KIND_NAMES = {_SCAN: "扫描元数据", _ANALYZE: "AI 分析", _AUDIO: "音频�
 #   音频复核先于语音归档 —— 归档的数据源是复核产出的转写与缓存 wav
 #   放行排在剪辑之前     —— 剪辑的自动处置会搬走未处置候选，而放行队列只认未处置，
 #                          排在后面就是空操作
+#   三堆对齐排在最后     —— 它按「保全状态」归档，早于剪辑跑会把刚剪出 A/B 的行
+#                          留在「待保全」里，等于白搬一次
 PIPELINE_STAGES = (
     ("scan", "扫描元数据"),
     ("analyze", "AI 分析"),
@@ -48,6 +50,7 @@ PIPELINE_STAGES = (
     ("archive", "语音档案归档"),
     ("release", "批量放行"),
     ("highlight", "画面精华剪辑"),
+    ("align", "回收目录三堆对齐"),
 )
 
 
@@ -68,7 +71,7 @@ class Job:
         self.started_at: float = 0.0
         self.ended_at: float = 0.0
         self.batch_id: Optional[int] = None
-        # 一键执行专用：当前处在第几个阶段（面板显示"阶段 3/6 · 音频复核"）。
+        # 一键执行专用：当前处在第几个阶段（面板显示"阶段 3/7 · 音频复核"）。
         # 其它任务恒为 0/0，面板照旧只显示进度条。
         self.stage_index: int = 0
         self.stage_count: int = 0
@@ -419,6 +422,14 @@ def _run_stage(job: Job, db, cfg: Dict, key: str, opts: Dict) -> str:
                 f"失败 {r.get('failed', 0)}；处置：保留 {kept} / 移入回收 {d.get('moved', 0)} / "
                 f"留待人工 {d.get('not_disposed', 0)}")
 
+    if key == "align":
+        from .mover import align_subdirs
+        res = align_subdirs(db, cfg, log=job.log)
+        if res["failed"] and not res["moved"] and not res["skipped"]:
+            raise PipelineError(f"三堆对齐全部失败：{res['errors'][:1]}")
+        return (f"归位 {res['moved']} 条，已在正确子档 {res['skipped']} 条"
+                + (f"，失败 {res['failed']} 条（详见日志）" if res["failed"] else ""))
+
     raise PipelineError(f"未知阶段：{key}")
 
 
@@ -488,9 +499,10 @@ def pipeline_precheck(cfg: Dict, opts: Dict) -> List[str]:
         elif not Path(src).exists():
             problems.append(f"视频源目录不存在：{src}")
 
-    if st.get("release", True) or st.get("highlight", True):
+    if st.get("release", True) or st.get("highlight", True) or st.get("align", True):
         if not (cfg.get("trash_root") or "").strip():
-            problems.append("未配置分级回收目录 trash_root —— 放行/剪辑自动处置需要它")
+            problems.append("未配置分级回收目录 trash_root —— 放行/剪辑自动处置/"
+                            "三堆对齐需要它")
 
     if st.get("audio", True):
         if not (cfg.get("audio", {}) or {}).get("enabled"):
