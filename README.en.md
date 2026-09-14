@@ -14,7 +14,7 @@ Picks out **false-positive motion-detection clips** from surveillance footage an
 | Misjudgment attribution | Flag "misjudged — keep" and the system attributes the cause automatically, keeps the result on screen, and aggregates it on the "Misjudgment Analysis" page |
 | 🔊 Audio re-review | For delete candidates: extract audio track → voice detection (FSMN-VAD) → full transcript shown to you → LLM judges usefulness (Alibaba FunASR + ollama/qwen3). Prevents deleting clips where something happens off-camera |
 | 🎞 Highlight clipping | Before deletion, cuts out the few seconds where "something is actually happening on screen" (L2.8): two-level detection (coarse 3fps@640 + fine 4fps@1280), A/B/C grade outputs. Together with the speech archive this forms the last line of defense before deletion |
-| ⚡ One-click pipeline | Chains "scan → analyze → audio re-review → speech archiving → bulk release → highlight clipping" into a single click, ending with the recycle directory ready (ADR 0004) |
+| ⚡ One-click pipeline | Chains "scan → analyze → audio re-review → speech archiving → bulk release → highlight clipping → recycle-directory triage" into a single click, ending with the recycle directory ready (ADR 0004) |
 
 **Scanning and analysis run in background threads**: after starting a job you can switch tabs and keep reviewing; progress refreshes every second, and jobs can be stopped at any time (finishing the current file first; already-written results are never lost).
 
@@ -68,7 +68,7 @@ cd <project dir>   # wherever you cloned this repo
 4. **"Batch Browse"** — paginated multi-select; after batch-moving to the recycle directory it **auto-generates a manifest CSV and space statistics**
 5. **"Highlight Review"** page — browse A/B products (C-grade is archival, safe to skip); the review workbench top bar has a **one-click release for "no-person" candidates**, backstopped by a highlight re-scan
 6. **"Misjudgment Analysis"** page — see the distribution of misjudgment causes and tuning suggestions
-7. Want it all in one go: the **"⚡ One-Click Pipeline"** at the top of "Settings & Scan" runs the full chain (including audio re-review + speech archiving + release + highlight clipping); when it's done, the only thing left is you manually emptying the recycle directory
+7. Want it all in one go: the **"⚡ One-Click Pipeline"** at the top of "Settings & Scan" runs the full chain (including audio re-review + speech archiving + release + highlight clipping + recycle-directory triage); when it's done, the only thing left is you manually emptying the recycle directory
 
 > Want it to run automatically on boot? Double-click `开机自启-安装.bat` (starts 30 s after login). While jobs run, the program
 > automatically requests "prevent system sleep" — details in [docs/启动与使用指南.md](docs/启动与使用指南.md) §5.2 (in Chinese).
