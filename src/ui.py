@@ -27,7 +27,6 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import feedback as fbmod  # noqa: E402
-from src import hotkeys  # noqa: E402
 from src import jobs as jobsmod  # noqa: E402
 from src import mover  # noqa: E402
 from src.analyzer import Analyzer  # noqa: E402
@@ -421,436 +420,11 @@ def render_sidebar(db, cfg):
 QUEUE_PAGE = 100  # 审核队列每页加载条数（避免一次性拉几万条 id）
 
 
-def _queue_filters() -> Dict[str, Any]:
-    """当前审核队列的筛选条件。
-
-    键名与 db.review_queue / db.count_review_queue 的形参一致，可直接 `**filt`
-    展开 —— 队列、计数、跳转定位三处必须打同一组参数，否则会出现
-    「页面说 300 条、翻到第 2 页却是空的」这类口径漂移。
-    """
-    f: Dict[str, Any] = {}
-    if st.session_state.get("rv_speech_only"):
-        f["speech_only"] = True
-    if st.session_state.get("rv_person_only"):
-        f["person_only"] = True
-    ms = float(st.session_state.get("rv_min_score") or 0)
-    if ms > 0:
-        f["min_score"] = ms
-    # Track C · C3：产物**只有 C 级**的视频是「档案」不是「待办」——
-    # 剪辑已留底（Track C 生效后 C 级也出可播放 mp4），再逐条过一遍等于把
-    # "多留"变成"多看"。默认滤掉，勾「含仅 C 级档案」可放回来。
-    # 只影响列表展示，不参与放行/审核任何判定。
-    if not st.session_state.get("rv_show_c_archive", False):
-        f["hide_c_archive"] = True
-    return f
-
-
-def _queue_sig(filt: Dict[str, Any] | None = None) -> str:
-    """筛选条件的指纹。变了就说明用户换了筛子，队列得从头重载。"""
-    return json.dumps(filt if filt is not None else _queue_filters(), sort_keys=True)
-
-
-def _queue_load(db, page: int, size: int, filt: Dict[str, Any]) -> List[int]:
-    return [r["id"] for r in db.review_queue(limit=size, offset=page * size, **filt)]
-
-
-def _queue_ensure(db, size: int, filt: Dict[str, Any]) -> None:
-    st.session_state.setdefault("q_page", 0)
-    sig = _queue_sig(filt)
-    filt_changed = st.session_state.get("_q_sig") not in (None, sig)
-    if ("queue" not in st.session_state or st.session_state.get("_q_reload")
-            or filt_changed):
-        if filt_changed:
-            st.session_state.q_page = 0      # 换了筛子，从第一条看起
-        st.session_state.queue = _queue_load(db, st.session_state.q_page, size, filt)
-        st.session_state.idx = 0
-        st.session_state["_q_reload"] = False
-        st.session_state["_q_sig"] = sig
-
-
-def _queue_step(db, delta: int, size: int, filt: Dict[str, Any]) -> None:
-    """翻页式移动。走到页首/页尾时自动加载相邻页，而不是一次性拉全量队列。"""
-    idx = st.session_state.idx + delta
-    q = st.session_state.queue
-    if idx < 0:
-        if st.session_state.q_page > 0:
-            st.session_state.q_page -= 1
-            st.session_state.queue = _queue_load(db, st.session_state.q_page, size, filt)
-            st.session_state.idx = max(0, len(st.session_state.queue) - 1)
-        else:
-            st.toast("已经是第一条了")
-        return
-    if idx >= len(q):
-        nxt = _queue_load(db, st.session_state.q_page + 1, size, filt)
-        if not nxt:
-            st.session_state.idx = max(0, len(q) - 1)
-            st.toast("已经是最后一条了")
-        else:
-            st.session_state.q_page += 1
-            st.session_state.queue = nxt
-            st.session_state.idx = 0
-        return
-    st.session_state.idx = idx
-
-
-def _queue_jump(db, target: int, size: int, filt: Dict[str, Any]) -> None:
-    """跳到队列第 target 条（0-based）。按需只加载它所在的那一页。
-
-    队列是「分数升序」的活视图，跳过去看到的就是那一刻库里的真实顺序；
-    这里不做位置补偿 —— 处置/放行会让条目离开队列，位置本就会漂。
-    """
-    total = db.count_review_queue(**filt)
-    if total <= 0:
-        return
-    target = max(0, min(int(target), total - 1))
-    page, idx = divmod(target, size)
-    if page != st.session_state.get("q_page") or not st.session_state.get("queue"):
-        st.session_state.q_page = page
-        st.session_state.queue = _queue_load(db, page, size, filt)
-        st.session_state["_q_sig"] = _queue_sig(filt)
-    st.session_state.idx = idx
-    st.session_state["_q_reload"] = False
-
-
-def _queue_clear_filters() -> None:
-    """清空筛选（回调里改 widget 状态 —— 渲染后再改 session_state 会抛异常）。"""
-    for k in ("rv_person_only", "rv_speech_only"):
-        st.session_state[k] = False
-    st.session_state["rv_show_c_archive"] = False   # 回到默认视图（C 级档案不占队列）
-    st.session_state["rv_min_score"] = 0.0
-
-
-def _render_queue_nav(db, filt: Dict[str, Any], total: int, pos: int) -> None:
-    """审核台的「定位 / 筛选」条（ADR 0002 的配套改动）。
-
-    队列降到几百条后，问题从"条目太多"变成"在这几百条里怎么定位" ——
-    跳转与筛选共用同一组谓词，跳过去的分数段和页面上显示的总数才对得上。
-    """
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([1.6, 0.7, 1.6, 0.7])
-        with c1:
-            st.number_input(f"跳到第几条（共 {total} 条）", min_value=1, step=1,
-                            value=min(max(pos, 1), max(total, 1)),
-                            key="rv_jump_idx",
-                            help="队列按分数升序，条号即当前位置")
-        with c2:
-            st.write("")   # 与左侧输入框的 label 对齐
-            if st.button("跳转", key="rv_jump_idx_go", use_container_width=True,
-                         disabled=total <= 0):
-                _queue_jump(db, int(st.session_state.rv_jump_idx) - 1, QUEUE_PAGE, filt)
-                st.rerun()
-        with c3:
-            st.number_input("跳到分数 ≥", min_value=0.0, step=10.0, value=0.0,
-                            key="rv_jump_score",
-                            help="跳到第一条「分数不低于该值」的片段；0 = 不用")
-        with c4:
-            st.write("")
-            if st.button("跳转", key="rv_jump_score_go", use_container_width=True,
-                         disabled=total <= 0):
-                sc = float(st.session_state.rv_jump_score or 0)
-                # 分数升序 ⇒ 低于 sc 的条数就是第一条 ≥sc 的位置；别在 UI 里自己算，
-                # 否则一加筛选条件跳转位置就与队列错位。
-                tgt = db.count_review_below(sc, **filt)
-                if tgt >= total:
-                    # 没有"分数够高"的片段：说清楚，别默默把人丢到末尾
-                    st.warning(f"没有分数 ≥ {sc:g} 的片段（队列里最高分还不到）")
-                else:
-                    _queue_jump(db, tgt, QUEUE_PAGE, filt)
-                    st.rerun()
-
-        f1, f2, f3, f4, f5 = st.columns([1.2, 1.2, 1.2, 1.5, 0.9])
-        with f1:
-            st.checkbox("仅看检出人物", key="rv_person_only",
-                        help="只看 L1 抽帧里检出人物的片段（无人片段交给批量放行 + 画面精华兜底）")
-        with f2:
-            st.checkbox("仅看检出人声", key="rv_speech_only",
-                        help="只看音频复核确认有说话内容的片段")
-        with f3:
-            # 不传 value=（默认取 min_value）——「清除筛选」回调要写这个 key，
-            # 同时传 value 会让 Streamlit 打 "default value vs Session State" 警告
-            st.number_input("最低分 ≥", min_value=0.0, step=10.0,
-                            key="rv_min_score", help="0 = 不限；与上面的跳转共用同一口径")
-        with f4:
-            st.checkbox("含仅 C 级档案", key="rv_show_c_archive",
-                        help="C 级产物是**档案**不是**待办**：剪辑已留底（含可播放 mp4），"
-                             "默认不进这条队列。想连它们一起过一遍时勾上。")
-        with f5:
-            st.write("")
-            if st.button("清除筛选", key="rv_filter_clear",
-                         use_container_width=True,
-                         disabled=not (filt.get("speech_only") or filt.get("person_only")
-                                       or filt.get("min_score")),
-                         on_click=_queue_clear_filters):
-                pass
-
-
-def _queue_drop_current() -> None:
-    """当前条已处置，从队列移除，下一条自动顶上。"""
-    q = st.session_state.queue
-    i = st.session_state.idx
-    if 0 <= i < len(q):
-        q.pop(i)
-    if st.session_state.idx >= len(q):
-        st.session_state.idx = max(0, len(q) - 1)
-
-
-def _render_release_candidates(db, cfg):
-    """审核减负 · 无人候选一键放行（ADR 0003）。
-
-    放行候选 = 判删候选里「机器没看到任何人物信号」的片段 —— 未检出人物，
-    且 decision_trace 里也没有"疑似人物未达阈值"。人眼盯 L1 那 16 张抽帧
-    不会比机器看到更多，逐条审它们不产生任何信息。
-    一键移入回收目录，之后由画面精华剪辑（8 倍采样密度 + 更低检出阈值）兜底重扫。
-    """
-    thr, need = mover.release_params(cfg)
-    n_rel = db.count_release(threshold=thr, require_no_person=need)
-    n_pending = db.count_review_queue()
-    if n_rel == 0:
-        return
-    # 提示只在仍有大批候选时出现；数量接近 0 时自动消失，不占版面
-    pct = n_rel * 100 // max(1, n_pending) if n_pending else 100
-    what = ("这些片段机器**没有检出任何人物信号**——没检出人，"
-            "连「疑似未达阈值」都没有。" if need
-            else "这些片段分数不高于放行门槛。")
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            st.markdown(
-                f"**⚡ 审核减负：{n_rel} 个「无人」片段可一键放行**"
-                f"（占当前待审核的 {pct}%）\n\n"
-                + what
-                + "人眼盯的缩略图正是机器抽的那 16 帧，逐条看不会比机器看到更多 —— "
-                  "属于无效劳动。放行后由「画面精华剪辑」用 **8 倍采样密度** 兜底重扫，"
-                  "万一有内容仍会剪出来。")
-            st.caption("检出的猫狗不拦（动物权重只有人物的三分之一）；"
-                       "「疑似人物」是唯一会拦住放行的信号。")
-        with c2:
-            trash_root = (cfg.get("trash_root") or "").strip()
-            if st.button(f"🗑 一键放行 {n_rel} 个无人片段", type="primary",
-                         use_container_width=True,
-                         disabled=not trash_root or jobsmod.any_running()):
-                rows = db.release_queue(limit=100000, threshold=thr,
-                                        require_no_person=need)
-                if not rows:
-                    st.rerun()
-                with st.spinner(f"正在移入分级回收目录（{len(rows)} 个，同盘 move 瞬间完成）..."):
-                    res = mover.move_all(db, rows, cfg)
-                if res["moved"]:
-                    st.toast(f"已放行 {res['moved']} 个，失败 {res['failed']} 个", icon="🗑")
-                else:
-                    st.warning(f"放行失败 {res['failed']} 个，详见报告")
-                for e in res["errors"]:
-                    st.caption(f"· {e}")
-                rep = res.get("reports") or {}
-                if rep:
-                    st.info(f"移动清单：`{rep.get('csv')}`\n\n空间统计：`{rep.get('txt')}`")
-                st.session_state["_q_reload"] = True   # 放行后待审队列已变化
-                st.rerun()
-            if not trash_root:
-                st.warning("未配置 trash_root，无法放行")
-            st.caption("程序只移动不删除；放行后请勿手动清空回收目录，"
-                       "先跑完「画面精华剪辑」留底。")
-
-
-def _render_last_feedback():
-    """渲染上一条的处置结果（处置后会跳到下一条，结果只能放在页面固定位置）。"""
-    item = st.session_state.get("last_fb")
-    if not item:
-        return
-    r = item["result"]
-    with st.container(border=True):
-        st.markdown(f"**上一条的处置结果**　`{item['name']}`")
-        if r.get("is_misjudgment"):
-            st.error(f"**误判原因：{r.get('label')}**")
-            st.write(r.get("detail"))
-            st.info(f"**改进建议：** {r.get('suggestion')}")
-            with st.expander("查看证据明细"):
-                st.json(r.get("evidence", {}))
-            st.caption("已记入误判分析，可在「误判分析」页查看整体分布与调参建议")
-        else:
-            st.success("已标记为保留（与 AI 判定一致，不计入误判）")
-        if st.button("知道了，清除提示", key="clear_last_fb"):
-            st.session_state["last_fb"] = None
-            st.rerun()
-
-
-def tab_review(db, cfg):
-    st.subheader("审核工作台")
-
-    # —— 审核减负 · 无人候选一键放行（ADR 0003：没看到人物信号的不值得人看）——
-    _render_release_candidates(db, cfg)
-
-    hk_on = st.checkbox("启用键盘快捷键", value=True, key="hk_on")
-    hotkeys.install(enabled=hk_on)
-    st.caption("快捷键：" + hotkeys.hint_markdown(enabled=hk_on))
-    _render_last_feedback()
-
-    fil = _queue_filters()
-    _queue_ensure(db, QUEUE_PAGE, fil)
-    queue: List[int] = st.session_state.queue
-    total_pending = db.count_review_queue(**fil)
-    offset0 = st.session_state.q_page * QUEUE_PAGE
-    cur_pos = offset0 + st.session_state.idx + 1
-
-    # 定位/筛选条先于空态渲染 —— 否则筛选条件把队列清空后，用户没有入口改回来
-    _render_queue_nav(db, fil, total_pending, cur_pos)
-
-    if not queue:
-        if fil:
-            st.warning("当前筛选条件下没有待审核片段 —— 放宽筛选，或点上面的「清除筛选」"
-                       "看全部待审核。")
-        else:
-            st.success("当前没有待审核的片段。可到「设置与扫描」页启动扫描与分析。")
-        if st.button("重新加载队列"):
-            st.session_state["_q_reload"] = True
-            st.rerun()
-        return
-
-    col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
-    with col_nav1:
-        if st.button("← 上一条", use_container_width=True):
-            _queue_step(db, -1, QUEUE_PAGE, fil)
-            st.rerun()
-    with col_nav2:
-        st.markdown(
-            f"<div style='text-align:center'>第 "
-            f"<b>{cur_pos}</b> / {max(total_pending, offset0 + len(queue))} 条"
-            f"　<span style='color:#888'>(按保留价值分升序，最可疑的排最前"
-            f"{'，已筛选' if fil else ''})</span></div>",
-            unsafe_allow_html=True)
-    with col_nav3:
-        if st.button("下一条 →", use_container_width=True):
-            _queue_step(db, 1, QUEUE_PAGE, fil)
-            st.rerun()
-
-    vid = queue[min(st.session_state.idx, len(queue) - 1)]
-    row = db.get_video(vid)
-    if not row:
-        st.error("记录不存在")
-        return
-    if row["verdict"] not in ("trash", "review"):
-        # 队列 id 缓存已过期：该条被重新分析退回 / 已被处置，不再属于审核范围。
-        # 重新加载当前页 —— _queue_load 按 review_queue 谓词查库，新页不会再失效，
-        # 因此这里 rerun 一次即可收敛，不会循环。
-        st.session_state["_q_reload"] = True
-        st.toast("队列已刷新（有片段被重新分析或已处置）", icon="🔄")
-        st.rerun()
-
-    left, right = st.columns([3, 2])
-    with left:
-        st.markdown(f"**{row['filename']}**")
-        st.caption(f"`{row['path']}`")
-        tp = thumb_of(row["id"])
-        if tp:
-            st.image(str(tp), use_container_width=True)
-        else:
-            st.warning("尚无缩略图（可能未分析或分析失败）")
-
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("▶ 用系统播放器打开", use_container_width=True):
-                vp = current_video_path(row)
-                if vp:
-                    open_in_player(str(vp))
-                else:
-                    st.error("原文件已不存在（源文件与回收目录都找不到）")
-        with b2:
-            if st.button("🌐 生成网页可播预览", use_container_width=True):
-                with st.spinner("转码中（H.265 → H.264，约需数秒）..."):
-                    pv = make_browser_preview(row, cfg)
-                if pv:
-                    st.session_state[f"pv_{row['id']}"] = str(pv)
-                else:
-                    st.error("转码失败")
-        if f"pv_{row['id']}" in st.session_state:
-            st.video(st.session_state[f"pv_{row['id']}"])
-
-        with st.expander("文件元数据", expanded=False):
-            st.json({
-                "年份": row["year"], "相对目录": row["rel_dir"],
-                "时长(秒)": row["duration_sec"], "分辨率": f"{row['width']}x{row['height']}",
-                "编码": row["video_codec"], "有音轨": bool(row["has_audio"]),
-                "大小(MB)": round((row["size_bytes"] or 0) / 1048576, 2),
-                "抽帧数": row["sampled_frames"],
-            })
-
-    with right:
-        st.markdown("### 为什么这么判定")
-        render_reasons(row, cfg)
-        render_audio_card(row, cfg)
-
-    st.divider()
-    st.markdown("### 你的处置")
-
-    # —— 音频复核关口：有音轨且未复核的判删候选，要求人工明示后才允许一键清理 ——
-    audio_gate = (bool(row["has_audio"]) and row["audio_checked"] is None
-                  and cfg.get("audio", {}).get("enabled"))
-    confirm_skip_audio = True
-    if audio_gate:
-        st.warning("⚠️ 此片段**有音轨但尚未音频复核**。若画外有人声，它可能是你要留的"
-                   "事件记录。建议先启动音频复核查看转写，再决定。")
-        confirm_skip_audio = st.checkbox(
-            "我已人工看过原始视频，确认不需要音频复核，允许直接清理",
-            key=f"askip_{row['id']}")
-    elif row["audio_checked"] == 1 and row["speech_present"] and row["llm_useful"] == 1:
-        st.info("该片段音频复核**检出人声**且 LLM 认为可能有用 —— 若你确认这段没有保留"
-                "价值，仍可清理；此提示仅为避免误删。")
-
-    note = st.text_input("备注（可选，会记入误判分析）", key=f"note_{row['id']}")
-
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        if st.button("🗑 确认清理（移入分级回收目录）", type="primary",
-                     use_container_width=True, disabled=not confirm_skip_audio):
-            if not cfg.get("trash_root"):
-                st.error("请先在「设置与扫描」配置 trash_root")
-            else:
-                tier = mover.decide_tier(row, cfg)
-                ok, msg = mover.move_one(db, row, cfg, tier)
-                if ok:
-                    st.session_state["last_fb"] = None
-                    _queue_drop_current()
-                    st.toast(f"已移入 {mover.TIER_NAMES[tier]}", icon="🗑")
-                    st.rerun()
-                else:
-                    st.error(msg)
-    with a2:
-        if st.button("✅ 误判，这段要保留", use_container_width=True):
-            analyzer = Analyzer(db, cfg)
-            r = fbmod.record_feedback(db, row, "keep", cfg,
-                                      yolo_on=analyzer.yolo_on, note=note)
-            # 存进 session_state，rerun 后仍能看到「为什么判错了」
-            st.session_state["last_fb"] = {
-                "vid": row["id"], "name": row["filename"], "result": r}
-            _queue_drop_current()
-            st.rerun()
-    with a3:
-        if st.button("↩ 撤销移动", use_container_width=True):
-            ok, msg = mover.undo_move(db, row)
-            if ok:
-                st.session_state["_q_reload"] = True
-                st.toast(msg, icon="↩")
-                st.rerun()
-            else:
-                st.error(msg)
-
-    # 移动历史
-    with st.expander("该文件的操作历史"):
-        with db.conn() as c:
-            logs = c.execute("SELECT * FROM action_log WHERE video_id=? ORDER BY id DESC",
-                             (row["id"],)).fetchall()
-        if logs:
-            st.dataframe([{"时间": l["created_at"], "动作": l["action"],
-                           "从": l["from_path"], "到": l["to_path"]} for l in logs],
-                         hide_index=True, use_container_width=True)
-        else:
-            st.caption("暂无操作记录")
-
-
-# --------------------------------------------------------------------------- 页签 2
-# 批量浏览格子里的音频摘要样式。九宫格每格很窄，转写必须限高截断，
-# 全文挂 title 由浏览器 hover 弹出（比塞进格子可读得多）。
-_GRID_AUDIO_CSS = """
+# --------------------------------------------------------------------------- 音频摘要行（可复用）
+# 原挂在「批量浏览」九宫格上，那页已随全量审核导航删除（ADR 0007）。
+# 但这段本身是**可复用资产**：格子/列表很窄时转写必须限高截断、全文挂 title
+# 由浏览器 hover 弹出，比塞进正文可读得多。抽查页与将来的列表视图还会用它。
+_AUDIO_LINE_CSS = """
 <style>
 .g-aud{font-size:.76rem;line-height:1.35;margin:2px 0 5px;word-break:break-all;
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
@@ -859,15 +433,18 @@ _GRID_AUDIO_CSS = """
 .g-aud-wait{color:#8892a0;font-style:italic}
 </style>
 """
+# 兼容旧名（测试与历史引用）
+_GRID_AUDIO_CSS = _AUDIO_LINE_CSS
 
-# LLM 有用性在格子里的紧凑标记（与审核台三态一致）
+# LLM 有用性在三态卡片里的紧凑标记（与审核台一致）
 _LLM_TAG = {1: "🟢有用", 0: "⚪无用", 2: "🟡不定"}
 
 
 def _grid_audio_html(row) -> str:
-    """批量浏览格子下方的音频信息行：有人声则高亮「占比 + 转写」，否则说明状态。
+    """音频信息行：有人声则高亮「占比 + 转写」，否则说明状态。
 
-    返回 HTML 片段；无音轨时返回空串（整行不渲染，避免给静音片段加噪音）。
+    四种状态：无音轨（返回空串，整行不渲染）/ 未复核 / 跳过 / 已复核。
+    无音轨返回空串是为了不给静音片段加噪音。
     """
     if not row["has_audio"]:
         return ""
@@ -896,238 +473,413 @@ def _grid_audio_html(row) -> str:
     return f"<div class='g-aud {cls}' title='{full}'>{head}　{shown}</div>"
 
 
-def _grid_sel_all(page_ids):
-    """「全选本页」回调：在脚本体执行前置位本页每个格子的复选框状态，
-    rerun 后格子才会真正呈现勾选态（带 key 的组件 value= 只在首次实例化生效）。"""
-    for i in page_ids:
-        st.session_state[f"g_{i}"] = True
-
-
-def _grid_sel_clear():
-    """「清空选择」回调：复位所有已选格子的复选框状态（含跨页残留），
-    并清空选中集合。只清 selected 集合的话，残留的组件状态会让下轮 rerun 重新勾上。"""
-    for i in list(st.session_state.get("selected", set())):
-        st.session_state[f"g_{i}"] = False
-    st.session_state["selected"] = set()
-
-
-def _grid_filters() -> Dict[str, Any]:
-    """批量浏览的筛选条件 —— 与审核台同一套 db 谓词，两页看到的条目口径一致。"""
-    f: Dict[str, Any] = {}
-    if st.session_state.get("grid_speech_only"):
-        f["speech_only"] = True
-    if st.session_state.get("grid_person_only"):
-        f["person_only"] = True
-    ms = float(st.session_state.get("grid_min_score") or 0)
-    if ms > 0:
-        f["min_score"] = ms
-    return f
-
-
-def tab_grid(db, cfg):
-    st.subheader("批量浏览")
-
-    st.session_state.setdefault("grid_page", 0)
-    st.session_state.setdefault("selected", set())
-    st.session_state.setdefault("grid_show_audio", True)
-    st.session_state.setdefault("grid_speech_only", False)
-    st.session_state.setdefault("grid_person_only", False)
-
-    def _to_first_page():
-        st.session_state.grid_page = 0
-
-    f1, f2, f3, f4, f5 = st.columns([1.1, 1.1, 1.1, 1, 2.2])
-    with f1:
-        st.checkbox("🎧 显示音频转写", key="grid_show_audio")
-    with f2:
-        st.checkbox("仅看检出人声", key="grid_speech_only", on_change=_to_first_page,
-                    help="只列出音频复核确认有说话内容的片段 —— 画外可能有人声事件，"
-                         "清理前值得单独过一遍")
-    with f3:
-        st.checkbox("仅看检出人物", key="grid_person_only", on_change=_to_first_page,
-                    help="只看 L1 抽帧里检出人物的片段；无人片段已由批量放行接管")
-    with f4:
-        st.number_input("最低分 ≥", min_value=0.0, step=10.0, value=0.0,
-                        key="grid_min_score", on_change=_to_first_page,
-                        help="0 = 不限")
-    with f5:
-        n_sp = db.count_review_queue(speech_only=True)
-        st.caption(f"待审核中 **{n_sp}** 段检出人声（画外可能有事件，"
-                   "清理前建议先看转写）")
-
-    fil = _grid_filters()
-    total = db.count_review_queue(**fil)
-    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    st.session_state.grid_page = min(st.session_state.grid_page, pages - 1)
-
-    n1, n2, n3, n4, n5 = st.columns([0.8, 1, 2, 1, 0.8])
-    with n1:
-        if st.button("⏮ 首页", key="grid_first", use_container_width=True,
-                     disabled=st.session_state.grid_page <= 0):
-            st.session_state.grid_page = 0
-            st.rerun()
-    with n2:
-        if st.button("← 上一页", key="grid_prev", use_container_width=True,
-                     disabled=st.session_state.grid_page <= 0):
-            st.session_state.grid_page -= 1
-            st.rerun()
-    with n3:
-        st.markdown(
-            f"<div style='text-align:center'>第 <b>{st.session_state.grid_page + 1}</b> / {pages} 页"
-            f"　<span style='color:#888'>共 {total} 条待审核（每页 {PAGE_SIZE} 条，"
-            f"按分数升序{'，已筛选' if fil else ''}）</span></div>",
-            unsafe_allow_html=True)
-    with n4:
-        if st.button("下一页 →", key="grid_next", use_container_width=True,
-                     disabled=st.session_state.grid_page >= pages - 1):
-            st.session_state.grid_page += 1
-            st.rerun()
-    with n5:
-        if st.button("末页 ⏭", key="grid_last", use_container_width=True,
-                     disabled=st.session_state.grid_page >= pages - 1):
-            st.session_state.grid_page = pages - 1
+def _render_last_feedback():
+    """渲染上一条的处置结果（处置后会跳到下一条，结果只能放在页面固定位置）。"""
+    item = st.session_state.get("last_fb")
+    if not item:
+        return
+    r = item["result"]
+    with st.container(border=True):
+        st.markdown(f"**上一条的处置结果**　`{item['name']}`")
+        if r.get("is_misjudgment"):
+            st.error(f"**误判原因：{r.get('label')}**")
+            st.write(r.get("detail"))
+            st.info(f"**改进建议：** {r.get('suggestion')}")
+            with st.expander("查看证据明细"):
+                st.json(r.get("evidence", {}))
+            st.caption("已记入误判分析，可在「误判分析」页查看整体分布与调参建议")
+        else:
+            st.success("已标记为保留（与 AI 判定一致，不计入误判）")
+        if st.button("知道了，清除提示", key="clear_last_fb"):
+            st.session_state["last_fb"] = None
             st.rerun()
 
-    # 页码跳转：翻页按钮在几百页面前等于没有导航，"直接去第 N 页"才是主通道
-    g1, g2, g3 = st.columns([1.6, 0.7, 3.7])
-    with g1:
-        st.number_input(f"跳到第几页（共 {pages} 页）", min_value=1, step=1,
-                        value=st.session_state.grid_page + 1, key="grid_jump_page",
-                        help="输入页码后点「跳转」，越界会自动收到最后一页")
-    with g2:
-        st.write("")
-        if st.button("跳转", key="grid_jump_go", use_container_width=True):
-            st.session_state.grid_page = int(st.session_state.grid_jump_page) - 1
-            st.rerun()
-    with g3:
-        st.write("")
-        st.caption("队列是按分数升序排的：分数低的在前 —— 越靠前越可能是删掉的，"
-                   "越靠后越值得看一眼画面。")
 
-    rows = db.review_queue(limit=PAGE_SIZE,
-                           offset=st.session_state.grid_page * PAGE_SIZE, **fil)
-    if not rows:
-        st.info("当前筛选条件下没有待审核片段" if fil else "没有待审核片段")
+def _spot_step(key: str, delta: int) -> None:
+    """抽查批次内的前后翻页。夹在 [0, 批大小-1]。"""
+    cur = int(st.session_state.get(f"{key}_i", 0))
+    n = len(st.session_state.get(f"{key}_batch", []) or [1])
+    st.session_state[f"{key}_i"] = max(0, min(cur + delta, n - 1))
+
+
+def _spot_reroll(key_prefix: str) -> None:
+    """「换一批」：种子 +1。
+
+    必须走 `on_click` 回调而不是在按钮分支里 `st.session_state[...] = ...` ——
+    Streamlit **禁止在 widget 实例化之后改它自己的 session_state 键**
+    （`StreamlitWidgetAlreadyInstantiatedError`）。回调在 widget 构造前注册，
+    触发时先更新值再 rerun，是唯一合法的做法。
+    """
+    st.session_state[f"{key_prefix}_seed"] = \
+        int(st.session_state.get(f"{key_prefix}_seed", 1)) + 1
+    st.session_state[f"{key_prefix}_i"] = 0
+
+
+def _spot_sample_bar(db, key_prefix: str, pool: Dict[str, int],
+                     total: int, extra: str = "") -> int:
+    """抽查工具条：抽多少条 + 随机种子 + 换一批。返回种子。
+
+    **「换一批」= seed + 1 而不是随机数** —— 这样"换一批"是可回退的
+    （把种子手填回上一个数就回到上一批），而真随机做不到这点。
+    抽查的核心用途是"多人对齐口径"或"复查某条"，两样都要求可复现。
+    """
+    c1, c2, c3, c4 = st.columns([1, 1, 1.3, 1.4])
+    with c1:
+        n = st.number_input("抽多少条", min_value=1, max_value=200,
+                            value=10, step=1, key=f"{key_prefix}_n",
+                            disabled=total == 0)
+    with c2:
+        seed = st.number_input("随机种子", min_value=0, max_value=99999,
+                               value=1, step=1, key=f"{key_prefix}_seed",
+                               help="同一个种子 + 同一份库 = 同一批样本。"
+                                    "想复查某条就把种子填回原来的值。")
+    with c3:
+        st.metric("抽样池", total)
+    with c4:
+        st.markdown(" ")
+        st.button("🎲 换一批", key=f"{key_prefix}_reroll",
+                   use_container_width=True, disabled=total == 0,
+                   on_click=_spot_reroll, args=(key_prefix,))
+    if total == 0:
+        st.warning("抽样池是空的 —— 没有符合条件的行可抽。")
+    if extra:
+        st.caption(extra)
+    return int(seed)
+
+
+def _spot_batch_state(key: str, seed: int) -> List[Any]:
+    """取当前批样本。**必须落 session_state** ——
+    否则每次 rerun 都重抽，点「下一条」时样本会漂移（抽到的和看到的不是一条）。"""
+    return st.session_state.get(f"{key}_batch", [])
+
+
+def tab_review(db, cfg):
+    st.subheader("抽查")
+    st.caption(
+        "程序已经把该做的做完了：扫描 → 分析 → 音频复核 → 语音档案 → 放行 → 精华剪辑 → "
+        "分堆，**全自动**（一键执行跑完整条链）。这一页只剩一件事：**随机抽几条，"
+        "看看机器判得准不准**。\n\n"
+        "**删除始终由你手动做** —— 程序只创建和移动，永不删除。")
+
+    entry = st.radio("抽查什么", ["🎯 L1 判定结果", "✂️ 已剪的 A/B 精华"],
+                     horizontal=True, key="spot_entry")
+    st.divider()
+    if entry.startswith("🎯"):
+        _spot_l1(db, cfg)
+    else:
+        _spot_clips(db, cfg)
+
+
+def _spot_l1(db, cfg) -> None:
+    """抽查入口 1：L1 判定结果。跨 verdict 分层抽样。
+
+    配额 trash:review:keep = 4:3:3 —— trash 加倍是因为那些**人已经被机器处置**
+    了，误判代价最大；keep 是 L1 漏洞最大的区（旧公式下 conf 0.4~0.6 全部
+    误判 keep），也必须抽到。
+    """
+    pool = db.count_sample_pool()
+    st.markdown("### 🎯 L1 判定结果")
+    quota = {"trash": 4, "review": 3, "keep": 3}
+    st.caption("按判定结果分层抽样："
+               + "、".join(f"{k} {v}" for k, v in quota.items())
+               + "（trash 加倍 —— 那些条已经被机器处置了，误判代价最大）。"
+               f"　当前池：keep {pool['keep']} / review {pool['review']} / "
+               f"trash {pool['trash']}。")
+    seed = _spot_sample_bar(db, "sp_l1", pool, pool["total"],
+                            extra="只抽 `quality_v2` 口径判出的行 —— "
+                                  "旧公式的样本混进来会把「公式不准」和"
+                                  "「样本不是这个公式判的」混为一谈。")
+    if pool["total"] == 0:
         return
 
-    st.markdown(_GRID_AUDIO_CSS, unsafe_allow_html=True)
+    # 分层抽样：各层用 seed 派生子种子，保证"同 seed 必得同一批"
+    import random as _rnd
+    picked: List[int] = []
+    want = int(st.session_state.get("sp_l1_n", 10))
+    with db.conn() as c:
+        for i, (v, q) in enumerate(quota.items()):
+            k = max(1, round(want * q / sum(quota.values())))
+            rows = db.sample_ids(seed=seed + i * 1000, n=k, l1_only=True)
+            picked += [r["id"] for r in rows if r["verdict"] == v]
+        picked = _rnd.Random(seed).sample(picked, min(len(picked), want)) \
+            if len(picked) > want else picked
 
-    selected = st.session_state.selected
-    # 清理已离开本页且未被选中的残留复选框键（移动/保留后视频会退出队列，
-    # 若不清除其 g_ 键，撤销回到队列时会呈现"幽灵勾选"）。p_/f_ 是播放/定位
-    # 按钮键，一并回收避免随翻页无限累积。
-    visible_ids = {r["id"] for r in rows}
-    for k in [k for k in st.session_state.keys()
-              if k.startswith(("g_", "p_", "f_"))]:
+    st.session_state["sp_l1_batch"] = picked
+    if not picked:
+        st.info("这一批没抽到行（池太小或种子恰好落空），点「换一批」试试。")
+        return
+    _spot_pager(db, cfg, picked, "sp_l1")
+
+
+def _spot_clips(db, cfg) -> None:
+    """抽查入口 2：已剪出的 A/B 级精华。按**片段**抽，不是按视频抽。"""
+    pool = db.count_sample_pool_ab()
+    st.markdown("### ✂️ 已剪的 A/B 精华")
+    seed = _spot_sample_bar(db, "sp_ab", pool, pool["total"],
+                            extra="按**片段**抽而不是按视频抽 —— 一条视频可能剪出 5 段，"
+                                  "按视频抽会让「剪得最多的那条」占掉大半样本，"
+                                  "而那正是机器最自信的部分。")
+    if pool["total"] == 0:
+        return
+    picked = db.sample_ab_clips(seed=seed, n=int(st.session_state.get("sp_ab_n", 10)))
+    st.session_state["sp_ab_batch"] = picked
+    if not picked:
+        st.info("这一批没抽到片段，点「换一批」试试。")
+        return
+
+    batch = picked
+    st.markdown(f"本批 **{len(batch)}** 段：")
+    st.dataframe(
+        [{"#": i + 1, "视频": b["video_id"], "级别": b.get("grade"),
+          "时长(秒)": b.get("dur"), "置信度": b.get("conf"),
+          "拍到的人": b.get("n_person"),
+          "文件": (b.get("file") or "")[-40:]}
+         for i, b in enumerate(batch)],
+        hide_index=True, use_container_width=True)
+    st.divider()
+    for i, b in enumerate(batch, 1):
+        _spot_clip_one(db, cfg, b, i, len(batch))
+
+
+def _spot_clip_one(db, cfg, clip, idx: int, total: int) -> None:
+    """一段精华的详情 + 改级别。"""
+    f = clip.get("file")
+    head = f"**{idx}/{total}** · {clip.get('grade')} 级 · {clip.get('dur')} 秒"
+    with st.expander(head, expanded=(idx == 1)):
+        left, right = st.columns([3, 2])
+        with left:
+            if f and Path(f).exists():
+                st.video(f)
+            elif f:
+                st.warning(f"产物文件已不在：{f}")
+            else:
+                st.info("这一段没有 mp4（只有静帧）")
+            if f and Path(f).exists():
+                b1, b2 = st.columns(2)
+                with b1:
+                    if st.button("▶ 播放", key=f"sp_play_{clip['video_id']}_{clip['index']}",
+                                 use_container_width=True):
+                        open_in_player(f)
+                with b2:
+                    if st.button("📂 定位", key=f"sp_loc_{clip['video_id']}_{clip['index']}",
+                                 use_container_width=True):
+                        reveal_in_explorer(f)
+        with right:
+            st.json({
+                "视频": clip.get("video_id"), "级别": clip.get("grade"),
+                "起止(秒)": [clip.get("start"), clip.get("end")],
+                "置信度": clip.get("conf"), "拍到的人": clip.get("n_person"),
+                "分数": clip.get("score"), "产出口径": clip.get("ver"),
+            })
+            g1, g2 = st.columns(2)
+            with g1:
+                if st.button("⬆️ 判高了 → 降为 B", key=f"sp_db_{clip['video_id']}_{clip['index']}",
+                             use_container_width=True,
+                             disabled=clip.get("grade") == "B"):
+                    _spot_regrade(db, cfg, clip, "B")
+            with g2:
+                if st.button("⬇️ 判低了 → 升为 A", key=f"sp_ua_{clip['video_id']}_{clip['index']}",
+                             use_container_width=True,
+                             disabled=clip.get("grade") == "A"):
+                    _spot_regrade(db, cfg, clip, "A")
+            st.caption("改级别只改**这一段**。若降级后该原片已无 A/B 产物，"
+                       "它会从回收目录的「已剪辑」挪回顶层档位 —— "
+                       "因为「已剪辑」的判据是这个原片有 A/B 级 mp4 在。")
+
+
+def _spot_regrade(db, cfg, clip, grade: str) -> None:
+    """改一段精华的级别，并按需重排子档。
+
+    ⚠️ clips 变了 ⇒ `mover.recycle_state()` 的判据变了 ⇒ 原片该待在哪个子档
+    也变了。db.set_clip_grade 已经同步了 highlight_best_grade / ab_clips_count
+    （不这么做，"已剪辑"标记会失真 ⇒ 机主以为可删、实际 A 级 mp4 还在）。
+    这里还要再调一次 align_one 把文件挪到正确的子档。
+    """
+    vid, idx = clip["video_id"], clip["index"]
+    if not db.set_clip_grade(vid, idx, grade):
+        st.error("改级别失败（片段索引可能已失效）")
+        st.rerun()
+    row = db.get_video(vid)
+    if row and row["trash_path"]:
         try:
-            vid = int(k[2:])
-        except ValueError:
-            continue
-        if vid not in visible_ids and vid not in selected:
-            del st.session_state[k]
-    cols_per_row = 4
-    for i in range(0, len(rows), cols_per_row):
-        cols = st.columns(cols_per_row)
-        for j, row in enumerate(rows[i:i + cols_per_row]):
-            with cols[j]:
-                tp = thumb_of(row["id"])
-                if tp:
-                    st.image(str(tp), use_container_width=True)
-                score = row["final_score"] if row["final_score"] is not None else row["retention_score"]
-                tier = mover.decide_tier(row, cfg)
-                st.caption(f"`{score:g}分` {tier}档　{row['filename'][:24]}"
-                           if score is not None else
-                           f"`—分` {tier}档　{row['filename'][:24]}")
-                if st.session_state.grid_show_audio:
-                    ah = _grid_audio_html(row)
-                    if ah:
-                        st.markdown(ah, unsafe_allow_html=True)
+            pending = db.pending_highlight_ids()
+        except Exception:  # noqa: BLE001 —— 抽样的辅助路径，失败不该炸页面
+            pending = None
+        ok, msg = mover.align_one(db, row, cfg, pending_ids=pending)
+        st.toast(msg if ok else f"级别已改，但子档未重排：{msg}",
+                 icon="✅" if ok else "⚠️")
+    st.rerun()
 
-                # 静态缩略图不足以判断画面内容 —— 直接调系统播放器 / 资源管理器
-                pb, fb, cb = st.columns([1, 1, 1.3])
-                with pb:
-                    if st.button("▶ 播放", key=f"p_{row['id']}",
-                                 help="用系统默认播放器打开原视频",
-                                 use_container_width=True):
-                        vp = current_video_path(row)
-                        if vp:
-                            open_in_player(str(vp))
-                            st.toast(f"已调用播放器：{vp.name}", icon="▶")
-                        else:
-                            st.error("原文件已不存在（可能已被手动删除）")
-                with fb:
-                    if st.button("📂 定位", key=f"f_{row['id']}",
-                                 help="在文件管理器中定位该文件",
-                                 use_container_width=True):
-                        vp = current_video_path(row)
-                        if vp:
-                            reveal_in_explorer(str(vp))
-                        else:
-                            st.error("原文件已不存在（可能已被手动删除）")
-                with cb:
-                    if st.checkbox("选择", key=f"g_{row['id']}",
-                                   value=row["id"] in selected):
-                        selected.add(row["id"])
-                    elif row["id"] in selected:
-                        selected.discard(row["id"])
-    st.session_state.selected = selected
+
+def _spot_pager(db, cfg, batch: List[int], key: str) -> None:
+    """在抽中的样本里翻页看（复用展示组件，不复用审核台的排序/跳转）。"""
+    i = int(st.session_state.get(f"{key}_i", 0))
+    i = max(0, min(i, len(batch) - 1))
+    st.session_state[f"{key}_i"] = i
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c1:
+        st.button("← 上一条", key=f"{key}_prev", use_container_width=True,
+                  disabled=i == 0, on_click=_spot_step, args=(key, -1))
+    with c2:
+        st.markdown(f"<div style='text-align:center'>本批第 <b>{i+1}</b> / "
+                    f"{len(batch)} 条</div>", unsafe_allow_html=True)
+    with c3:
+        st.button("下一条 →", key=f"{key}_next", use_container_width=True,
+                  disabled=i >= len(batch) - 1,
+                  on_click=_spot_step, args=(key, 1))
+
+    row = db.get_video(batch[i])
+    if not row:
+        st.error("记录不存在")
+        return
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown(f"**{row['filename']}**")
+        st.caption(f"`{row['path']}`")
+        tp = thumb_of(row["id"])
+        if tp:
+            st.image(str(tp), use_container_width=True)
+        else:
+            st.warning("尚无缩略图（可能未分析或分析失败）")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("▶ 用系统播放器打开", key=f"{key}_play_{row['id']}",
+                         use_container_width=True):
+                vp = current_video_path(row)
+                if vp:
+                    open_in_player(str(vp))
+                else:
+                    st.error("原文件已不存在")
+        with b2:
+            if st.button("🌐 生成网页可播预览", key=f"{key}_pv_{row['id']}",
+                         use_container_width=True):
+                with st.spinner("转码中（H.265 → H.264，约需数秒）..."):
+                    pv = make_browser_preview(row, cfg)
+                if pv:
+                    st.session_state[f"pv_{row['id']}"] = str(pv)
+                else:
+                    st.error("转码失败")
+        if f"pv_{row['id']}" in st.session_state:
+            st.video(st.session_state[f"pv_{row['id']}"])
+    with right:
+        st.markdown("### 为什么这么判定")
+        render_reasons(row, cfg)
+        # 音频摘要行（可复用资产，原挂九宫格；抽查时"画外说了什么"同样要紧）
+        st.markdown(_AUDIO_LINE_CSS, unsafe_allow_html=True)
+        st.markdown(_grid_audio_html(row) or "", unsafe_allow_html=True)
+        render_audio_card(row, cfg)
 
     st.divider()
+    st.markdown("### 抽查处置")
+    _spot_actions(db, cfg, row, key)
 
-    # —— 批量移入关口：所选里混有"有音轨且未复核"的判删候选时要求明示 ——
-    b_gate_ok = True
-    if selected and cfg.get("audio", {}).get("enabled"):
-        sel_rows = [db.get_video(i) for i in selected]
-        gate_rows = [r for r in sel_rows
-                     if r and r["has_audio"] and r["audio_checked"] is None]
-        if gate_rows:
-            st.warning(f"所选 **{len(selected)}** 个中有 **{len(gate_rows)} 个有音轨但尚未"
-                       "音频复核** —— 画面无人不代表没有内容，画外可能有人声事件。"
-                       "建议先跑音频复核（转写文本会在审核台展示），再回来批量移入。")
-            b_gate_ok = st.checkbox("我已人工确认这批无需音频复核，允许直接批量移入",
-                                    key="b_gate_ok")
 
-    c0, c1, c2, c3 = st.columns([2, 2, 2, 2])
-    c0.write(f"已选 **{len(selected)}** 个（跨页累积）")
-    page_ids = [r["id"] for r in rows]
-    with c1:
-        st.button("全选本页", use_container_width=True,
-                  on_click=_grid_sel_all, args=(page_ids,))
-    with c2:
-        st.button("清空选择", use_container_width=True, disabled=not selected,
-                  on_click=_grid_sel_clear)
-    with c3:
-        if st.button("🗑 批量移入回收目录", type="primary", use_container_width=True,
-                     disabled=(not selected or not b_gate_ok)):
-            if not cfg.get("trash_root"):
-                st.error("请先配置 trash_root")
-            else:
-                targets = [db.get_video(i) for i in selected]
-                targets = [t for t in targets if t]
-                with st.spinner(f"正在移动 {len(targets)} 个文件（同盘 move，瞬间完成）..."):
-                    res = mover.move_rows(db, targets, cfg)
-                st.success(f"已移动 {res['moved']} 个，失败 {res['failed']} 个")
-                for e in res["errors"]:
-                    st.caption(f"· {e}")
-                rep = res.get("reports") or {}
-                if rep:
-                    st.info(f"已自动生成清单：`{rep.get('csv')}`\n\n"
-                            f"空间统计：`{rep.get('txt')}`")
-                st.session_state.selected = set()
-                st.rerun()
+def _spot_actions(db, cfg, row, key: str) -> None:
+    """抽查的四个动作：判对了 / 该留 / 该删 / 记为误判。
 
-    d1, d2 = st.columns([3, 2])
-    with d1:
-        if st.button("✅ 批量标记保留", use_container_width=True, disabled=not selected):
-            for i in selected:
-                r = db.get_video(i)
-                if r:
-                    db.set_human_decision(i, "keep")
-            st.success(f"已标记 {len(selected)} 个为保留")
-            st.session_state.selected = set()
+    与旧审核台的三个按钮相比，**核心区别是"该留"能掉头**：
+    旧审核台的"误判保留"只写 keep 不搬文件，于是原片留在回收目录里 ——
+    机主后来清空回收目录时它一起没了。抽查看到"这个不该删"时，正确的反应
+    是**立刻把它搬回源目录**，因为那时它还在。
+
+    ⚠️ meta_ok=0 的行**不能**开「该删」：解码失败行（私有编码）的 verdict='keep'
+    是"解不开就绝不判删"的技术兜底，而 `_PENDING_OR_TRASHED` 的 A 分支
+    （human_decision='trash' AND trash_path IS NOT NULL）**没有 meta_ok=1** ——
+    不设 disabled 就能把"出于安全保留"的行移进回收目录。
+    """
+    from src import feedback as fbmod
+
+    vid = row["id"]
+    is_meta_ok = bool(row["meta_ok"])
+    has_trash = bool(row["trash_path"])
+    decided = row["human_decision"]
+
+    st.caption(f"当前机器处置："
+               + ("未处置" if decided is None else
+                  ("已移入回收目录" if decided == "trash" else "判为保留"))
+               + (f"　·　本行由**{'程序' if row['decided_by'] == 'auto' else ('人' if row['decided_by'] == 'human' else '历史数据')}**"
+                  "决定" if "decided_by" in row.keys() else ""))
+
+    # 音频未复核 → 提示但**不拦**。
+    #
+    # 为什么不再拦（旧审核台会 `disabled=not confirm_skip_audio`）：
+    # 音频复核队列早已放宽为「处置候选」—— 移入回收目录后仍能补复核
+    # （audioreview.review_one 有 trash_path 回落），补完照常落成语音档案。
+    # 所以"半拦半不拦"（程序路径不拦、UI 路径拦）反而让一键执行的终点不可预期，
+    # `_dispose_one` 早已因此撤掉了同一道守卫。这里保持同口径：
+    # **给提示（画外有人声就丢了这���信息值得知道），不阻断**。
+    # 唯一的硬期限是"手动清空回收目录"之前必须把复核+归档跑完。
+    if bool(row["has_audio"]) and row["audio_checked"] is None \
+            and cfg.get("audio", {}).get("enabled"):
+        st.warning("⚠️ 此片段**有音轨但尚未音频复核**。若画外有人声，它可能是你要留的"
+                   "事件记录。移入回收目录后仍可补复核（只要还没手动清空回收目录）。")
+    elif row["audio_checked"] == 1 and row["speech_present"] and row["llm_useful"] == 1:
+        st.info("该片段音频复核**检出人声**且 LLM 认为可能有用 —— 若你确认这段没有保留"
+                "价值，仍可移走；此提示仅为避免误删。")
+
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        if st.button("✅ 判对了", key=f"{key}_ok_{vid}", use_container_width=True):
+            db.log_action(vid, "spotcheck_ok", "", "", row["batch_id"])
+            st.toast("已记：判对了", icon="✅")
             st.rerun()
-    with d2:
-        st.caption("A 档 = 高置信可批量删；B 档 = 建议抽查后再删")
+    with a2:
+        if st.button("⬆️ 判错了，该留", key=f"{key}_keep_{vid}",
+                     type="primary", use_container_width=True):
+            if has_trash:
+                ok, msg = mover.undo_move(db, row)
+                if ok:
+                    st.toast(f"已搬回源目录：{msg}", icon="↩")
+                else:
+                    # 回收路径上的文件已经没了（被手动删过？）—— 只改判定，
+                    # 但必须显式说清楚，否则行会带着失效的 trash_path，
+                    # 空间统计会错报"这个文件在回收目录里"
+                    db.set_human_decision(vid, "keep", decided_by="human")
+                    st.warning(f"搬回失败（{msg}）。已改为「判为保留」，"
+                               f"但原文件已不在回收目录 —— 请你确认它还在别处。")
+            else:
+                db.set_human_decision(vid, "keep", decided_by="human")
+                st.toast("已记：判为保留", icon="↩")
+            st.rerun()
+    with a3:
+        if st.button("⬇️ 判错了，该删", key=f"{key}_trash_{vid}",
+                     use_container_width=True,
+                     disabled=not is_meta_ok or decided == "trash"):
+            if not cfg.get("trash_root"):
+                st.error("请先在「设置与扫描」配置 trash_root")
+            elif not has_trash:
+                tier = mover.decide_tier(row, cfg)
+                ok, msg = mover.move_one(db, row, cfg, tier, by="human")
+                st.toast(msg if ok else msg, icon="🗑" if ok else "⚠️")
+                st.rerun()
+            else:
+                st.info("已在回收目录里了，无需再移。")
+        if not is_meta_ok:
+            st.caption("⚠️ 该片段分析失败（多半是私有编码解不开）。"
+                       "按安全兜底它永远判「保留」，不允许从这里移走。")
+    with a4:
+        if st.button("🏷️ 记为误判（留证据）", key=f"{key}_fb_{vid}",
+                     use_container_width=True):
+            analyzer = Analyzer(db, cfg)
+            r = fbmod.record_feedback(db, row, "keep", cfg,
+                                      yolo_on=analyzer.yolo_on,
+                                      note="抽查发现")
+            st.session_state["last_fb"] = {
+                "vid": vid, "name": row["filename"], "result": r}
+            st.toast("已记入误判分析页（不改变处置结论）", icon="🏷️")
+
+    with st.expander("该文件的操作历史"):
+        with db.conn() as c:
+            logs = c.execute(
+                "SELECT * FROM action_log WHERE video_id=? ORDER BY id DESC",
+                (vid,)).fetchall()
+        if logs:
+            st.dataframe([{"时间": l["created_at"], "动作": l["action"],
+                           "从": l["from_path"], "到": l["to_path"]} for l in logs],
+                         hide_index=True, use_container_width=True)
+        else:
+            st.caption("（无记录）")
+
 
 
 # --------------------------------------------------------------------------- 页签 3
@@ -1502,14 +1254,17 @@ def _render_pipeline(db, cfg) -> int:
             on[key] = c.checkbox(name, value=bool(stages.get(key, True)),
                                  key=f"pipe_st_{key}")
 
-    # 待办概览：这些数字就是"点一下会发生什么"
+    # 待办概览：这些数字就是"点一下会发生什么"。
+    # 「待审核」用 hide_c_archive=True（审核台的默认视图：滤掉「仅 C 级档案」）
+    # —— 之前这里传的是空参，与审核台实际显示的队列规模天然不等，
+    # 是 ADR 0005「三处逐字一致」被破掉的最后一个实例。
     _m = st.columns(7)
     _m[0].metric("待分析", _count_analyze_todo(db))
     _m[1].metric("待音频复核", db.count_audio_pending())
     _m[2].metric("待归档", db.count_archive_pending())
     _m[3].metric("待放行", db.count_release(*mover.release_params(cfg)))
     _m[4].metric("待剪辑", db.count_highlight_pending())
-    _m[5].metric("待审核", db.count_review_queue())
+    _m[5].metric("待审核", db.count_review_queue(hide_c_archive=True))
     _m[6].metric("待归位", sum(mover.recycle_stats(db, cfg)["to_align"].values()))
     st.caption("「待分析」= 已导入但没跑过判定的；「待放行」= 判删候选里没有任何人物信号的"
                "（动物/车辆不拦）。放行不清空剪辑队列 —— 它们仍会被重扫兜底。"
@@ -1575,6 +1330,93 @@ def tab_settings(db, cfg):
         _render_step_by_step(db, cfg, limit)
 
 
+def _render_scoring_params(cfg) -> None:
+    """判定参数：口径切换（legacy / quality_v2）+ 三档阈值 + 抽帧数。
+
+    为什么这一段要暴露在 UI 上而不是只改 config.json：口径切换与阈值是**一对**，
+    换公式不换阈值会让 trash 几乎不可达（v2 是 0-100 质量分，而 trash_threshold=0
+    是旧 125 分制的口径）。让人在同一个页面里同时看到两者 + 一条校验提示，
+    比让人自己去猜"这两个要一起改"可靠。
+
+    ⚠️ 改完**不会**自动重跑 —— 下面的「退回待分析」是独立一步。
+    这里只在参数自洽时保存；不自洽（quality_v2 + trash_threshold<=0）时给警告
+    但仍允许保存（机主可能就是要先看效果）。
+    """
+    sc = cfg.setdefault("scoring", {})
+    vd = cfg.setdefault("verdict", {})
+    an = cfg.setdefault("analysis", {})
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        mode = st.selectbox(
+            "打分口径", ["quality_v2", "legacy"],
+            index=0 if str(sc.get("mode", "legacy")) == "quality_v2" else 1,
+            key="sc_mode",
+            help="quality_v2 = 多帧一致性 + 质量扣分（推荐）。\n"
+                 "legacy = 旧公式（单帧最高 conf），保留用于对比与回滚。\n"
+                 "切换后**必须**重跑分析才生效。")
+        st.caption("**quality_v2 修掉的核心问题**：旧公式下 conf ≥ 0.6 一律判保留，"
+                   "而检测阈值是 0.4 —— 0.4~0.6 之间的真人全部被误判为「有价值」，"
+                   "永不进任何队列，精华剪辑的重扫也就无从触发。")
+    with c2:
+        n_frames = st.number_input(
+            "每片段抽帧数", min_value=3, max_value=60,
+            value=int(an.get("sample_frames", 6) or 6), step=1,
+            key="sc_frames",
+            help="quality_v2 的多帧一致性靠这个数：抽得越少，"
+                 "一致性判据越不可靠。**低于 12 基本失效**，建议 15。")
+
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        trash_thr = st.number_input(
+            "建议清理 ≤", min_value=0.0, max_value=200.0,
+            value=float(vd.get("trash_threshold", 0) or 0), step=1.0,
+            key="sc_trash", help="分数低于此值 ⇒ 建议清理。")
+    with t2:
+        review_thr = st.number_input(
+            "需人工确认 <", min_value=0.0, max_value=300.0,
+            value=float(vd.get("review_threshold", 30) or 30), step=1.0,
+            key="sc_review",
+            help="分数低于此值但高于「建议清理」⇒ 进队列。\n"
+                 "⚠️ 旧公式是 125 分制（满分约 125），quality_v2 是 0-100 质量分，"
+                 "**两套口径的阈值不能混用**。")
+    with t3:
+        rel_thr = st.number_input(
+            "批量放行 ≤", min_value=0.0, max_value=200.0,
+            value=float(vd.get("release_threshold", 30) or 30), step=1.0,
+            key="sc_release",
+            help="「机器没看到任何人」且分数不高于此值 ⇒ 免审核移入回收目录。"
+                 "quality_v2 的起点值是 20。")
+
+    changed = (str(sc.get("mode", "legacy")) != mode
+               or float(vd.get("trash_threshold", 0) or 0) != float(trash_thr)
+               or float(vd.get("review_threshold", 30) or 30) != float(review_thr)
+               or float(vd.get("release_threshold", 30) or 30) != float(rel_thr)
+               or int(an.get("sample_frames", 6) or 6) != int(n_frames))
+
+    # 口径与阈值的自洽检查（config._warn_sample_frames 里有同款逻辑，
+    # 这里是 UI 侧的即时反馈，让人不保存就看见问题）
+    if mode == "quality_v2":
+        if float(trash_thr) <= 0:
+            st.warning("⚠️ quality_v2 是 **0-100 质量分**，而「建议清理 ≤」是 0 —— "
+                       "这会让「建议清理」几乎不可达（只有恰好 0 分才算）。"
+                       "起点值建议 **20**。")
+        if int(n_frames) < 12:
+            st.warning(f"⚠️ 只抽 {int(n_frames)} 帧时，多帧一致性判据基本失效"
+                       f"（分数照算，但不可信）。建议提到 **12** 以上。")
+
+    if st.button("💾 保存判定参数", disabled=not changed, use_container_width=True):
+        sc["mode"] = mode
+        vd["trash_threshold"] = float(trash_thr)
+        vd["review_threshold"] = float(review_thr)
+        vd["release_threshold"] = float(rel_thr)
+        an["sample_frames"] = int(n_frames)
+        save_config(cfg)
+        st.success("已保存。**已分析的记录不会自动改变** —— "
+                   "要生效请在下一段点「退回待分析」再重跑。")
+        st.rerun()
+
+
 def _render_step_by_step(db, cfg, limit: int):
     st.markdown("##### 执行（后台运行，不阻塞页面）")
     st.caption("任务跑在独立线程里：启动后可以随意切换页签、继续审核，进度在下方实时显示。"
@@ -1616,6 +1458,11 @@ def _render_step_by_step(db, cfg, limit: int):
         job_panel(sj, "🔍 扫描元数据", "scan")
     with p2:
         job_panel(aj, "🤖 AI 分析", "analyze")
+
+    # ------------------------------------------------------------ 判定参数
+    st.divider()
+    st.markdown("##### 🎚 判定参数（改完记得「退回待分析」再重跑）")
+    _render_scoring_params(cfg)
 
     # ------------------------------------------------------------ 重新分析
     st.divider()
@@ -1964,6 +1811,18 @@ def main():
                        page_icon="🎬", layout="wide")
     cfg = cfg_now()
 
+    # 自检钩子（scripts/selftest.py 与 smoke_ui.py 用）：设了环境变量
+    # VIDEO_SEARCH_DB_OVERRIDE 就把库路径指到临时库。
+    #
+    # 为什么需要：AppTest 跑的是整个 main()，而 main() 自己 load_config() +
+    # get_db()，没法从 session_state 注入 —— 结果自检会去连**项目真实库**。
+    # 真实库不存在（新机首次装 / 库被清 / CI）时整个自检在第一处就崩，
+    # 后面上百项根本没跑。2026-10-04 真实库丢失时就是这样炸的。
+    # 这个钩子让自检只依赖代码，不依赖任何既有数据。
+    override = os.environ.get("VIDEO_SEARCH_DB_OVERRIDE")
+    if override:
+        cfg["runtime"]["sqlite_path"] = override
+
     # 配置损坏后由 config.load_config 自动恢复过，这里把情况告诉用户，
     # 否则用户只会看到"配置莫名其妙变了"而不知道发生过什么。
     notice = getattr(cfgmod, "LAST_NOTICE", "")
@@ -1973,19 +1832,21 @@ def main():
     db = get_db(cfg["runtime"]["sqlite_path"])
     render_sidebar(db, cfg)
 
-    t1, t2, t3, t4, t5, t6 = st.tabs(
-        ["审核工作台", "批量浏览", "精华复核", "执行进度", "误判分析", "设置与扫描"])
+    # 5 个页签（2026-10-04 从 6 个减来）：审核工作台与批量浏览已重做为
+    # **抽查**（tab_review），旧「批量浏览」整页删除 ——
+    # `st.tabs` 每次 rerun 会执行**所有** tab 的代码，那一页一次渲染
+    # 24 缩略图 + 72 个按钮，删它是性能收益不是审美选择（见 ADR 0007）。
+    t1, t2, t3, t4, t5 = st.tabs(
+        ["抽查", "执行进度", "精华复核", "误判与改判", "设置与扫描"])
     with t1:
         tab_review(db, cfg)
     with t2:
-        tab_grid(db, cfg)
+        tab_progress(db, cfg)
     with t3:
         tab_highlight(db, cfg)
     with t4:
-        tab_progress(db, cfg)
-    with t5:
         tab_feedback(db, cfg)
-    with t6:
+    with t5:
         tab_settings(db, cfg)
 
 

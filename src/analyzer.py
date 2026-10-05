@@ -204,6 +204,293 @@ def _class_of(name: str, cfg: Dict) -> str:
     return "other"
 
 
+def _class_stats(dets: List[Dict], grp: str, cfg: Dict,
+                 n_frames: int) -> Dict[str, Any]:
+    """某一类目标在**多帧**上的统计 —— 质量分公式的输入。
+
+    现状的问题：`build_decision` 只对"单帧最高 conf"加权，而 `best[grp]`
+    取的是 `max(conf)` —— 一个人只在 1 帧被检出、和 15 帧全被检出，得分**完全一样**。
+    加上 `person_weight=50` 与 `review_threshold=30`，只要 conf ≥ 0.6 就直接 keep。
+
+    这里统计六个量：
+        frames   至少一帧检出（conf ≥ thr）的**帧数** —— 连续出现比闪现更可信
+        persist  frames / n_frames —— 一致性系数。**分母用实际抽到的帧数**
+                 （n_frames），不用配置值：短片或部分解码失败时按配置算会低估
+        conf_top 单帧最高 conf（展示 + F2 保底用）
+        conf_med 各命中帧 conf 的**中位数** —— 抗单帧误检的主力
+        area_max 该类最大面积占比（远小判据）
+        area_med 面积中位数（抗单帧大框误检）
+
+    输入的 dets 必须带 `d["frame"]` 帧序号（analyze_one 里打的）。
+    """
+    thr = float(cfg["analysis"]["yolo_conf_threshold"])
+    hits = []
+    for d in dets:
+        if _class_of(d["class"], cfg) != grp:
+            continue
+        if d["conf"] < thr:
+            continue
+        hits.append(d)
+    total = max(1, int(n_frames or 0))
+    if not hits:
+        return {"frames": 0, "persist": 0.0, "conf_top": 0.0, "conf_med": 0.0,
+                "area_max": 0.0, "area_med": 0.0}
+    confs = sorted(float(d["conf"]) for d in hits)
+    areas = sorted(float(d.get("area_ratio", 0.0)) for d in hits)
+    mid = len(confs) // 2
+    med_conf = confs[mid] if len(confs) % 2 else (confs[mid - 1] + confs[mid]) / 2
+    mid_a = len(areas) // 2
+    med_area = areas[mid_a] if len(areas) % 2 else (areas[mid_a - 1] + areas[mid_a]) / 2
+    frames = len({int(d.get("frame", -1)) for d in hits})
+    return {
+        "frames": frames,
+        "persist": min(1.0, frames / total),
+        "conf_top": round(float(confs[-1]), 4),
+        "conf_med": round(float(med_conf), 4),
+        "area_max": round(float(areas[-1]), 5),
+        "area_med": round(float(med_area), 5),
+    }
+
+
+def _score_quality_v2(dets_all: List[Dict], motion: float,
+                      audio_energy: Optional[float], has_audio: bool,
+                      fstats: Dict, cfg: Dict, yolo_on: bool,
+                      n_frames: int, thr: float, raw_min: float,
+                      ) -> Dict[str, Any]:
+    """质量分公式（`scoring.mode = "quality_v2"`）。
+
+    三步：**多帧一致性聚合 → noisy-OR 内容分 → 质量乘数**。
+
+    为什么用乘数不用减法：内容分 0-100、扣分 0-45，减法会让
+    `max(0, 小内容 − 大扣分) = 0` 直接落 trash —— 那等于"质量差否决内容"。
+    乘数最低 0.5、永不清零，语义正确：**质量差只降低置信，不否决内容**。
+
+    为什么用 noisy-OR 不用裸加法：裸加法可以无限累加（三个弱信号叠加就刷满），
+    noisy-OR 天然饱和、逐项可解释、且天然落在 0-100。
+    """
+    sc = cfg.get("scoring", {})
+    vd = cfg.get("verdict", {})
+    cons = sc.get("consistency", {})
+    size = sc.get("size", {})
+    qual = sc.get("quality", {})
+    cont = sc.get("content", {})
+
+    # ---- Step 1: 多帧一致性 ----
+    st = {g: _class_stats(dets_all, g, cfg, n_frames)
+          for g in ("person", "vehicle", "animal")}
+
+    # near_miss 仍按"单帧最高 conf"口径 —— decide_tier / release_queue /
+    # feedback 四处消费者依赖它，一个字都不能改。公式 v2 只**新增**统计量。
+    near: Dict[str, float] = {}
+    for d in dets_all:
+        grp = _class_of(d["class"], cfg)
+        if grp == "other" or d["conf"] >= thr or d["conf"] < raw_min:
+            continue
+        near[grp] = max(near.get(grp, 0.0), float(d["conf"]))
+
+    p_full = float(cons.get("persist_full", 0.4))
+    a_ref = size.get("area_ref") or {}
+    reasons: List[Dict[str, Any]] = []
+
+    def _component(grp: str, label: str, w: float) -> float:
+        s = st[grp]
+        if s["frames"] == 0:
+            return 0.0
+        b_persist = (float(cons.get("persist_floor", 0.6))
+                     + (1.0 - float(cons.get("persist_floor", 0.6)))
+                     * min(1.0, s["persist"] / p_full))
+        ref = float(a_ref.get(grp, 0.05)) or 0.05
+        b_size = (float(size.get("size_floor", 0.5))
+                  + (1.0 - float(size.get("size_floor", 0.5)))
+                  * min(1.0, s["area_med"] / ref))
+        c = float(w) * s["conf_med"] * b_persist * b_size
+        reasons.append({
+            "factor": label, "result": "检出",
+            "contribution": round(c * 100, 1),
+            "detail": (f"置信度中位数 {s['conf_med']:.2f}（峰值 {s['conf_top']:.2f}）、"
+                       f"{s['frames']}/{n_frames} 帧出现、面积占比中位数 "
+                       f"{s['area_med']*100:.1f}%（最大 {s['area_max']*100:.1f}%）"),
+            "level": "keep",
+        })
+        return c
+
+    c_person = _component("person", "人物", cont.get("w_person", 0.55))
+    c_vehicle = _component("vehicle", "车辆", cont.get("w_vehicle", 0.45))
+    c_animal = _component("animal", "动物", cont.get("w_animal", 0.20))
+    for g, label in (("person", "人物"), ("vehicle", "车辆"), ("animal", "动物")):
+        if st[g]["frames"] == 0:
+            reasons.append({
+                "factor": label, "result": "未检出", "contribution": 0,
+                "detail": ("未检测到" + ("人物" if g == "person" else label)
+                           if yolo_on else "未启用目标检测模型，该项未参与判定"),
+                "level": "trash" if g != "animal" else "neutral",
+            })
+        elif g in near:
+            reasons.append({
+                "factor": label, "result": "另有未达阈值检出", "contribution": 0,
+                "detail": f"另有置信度 {near[g]:.2f} 的疑似检出未达判定阈值 {thr:.2f}",
+                "level": "warn",
+            })
+
+    # 动静 / 音频：只作为**弱信号**参与内容分（不再一次性 +10/+10）
+    m_thr = float(sc.get("motion_area_threshold", 0.05))
+    c_motion = float(cont.get("w_motion", 0.15)) if motion > m_thr else 0.0
+    c_audio = 0.0
+    if has_audio and audio_energy is not None:
+        if audio_energy > float(sc.get("audio_db_threshold", -50.0)):
+            c_audio = float(cont.get("w_audio", 0.15))
+    reasons.append({
+        "factor": "画面动静",
+        "result": "显著" if motion > m_thr else "微弱",
+        "contribution": round(c_motion * 100, 1),
+        "detail": (f"画面变化区域占比 {motion*100:.1f}%（阈值 {m_thr*100:.0f}%）"
+                   + ("" if motion > m_thr else "，符合环境干扰（树叶/光影）特征")),
+        "level": "keep" if motion > m_thr else "trash",
+    })
+    reasons.append({
+        "factor": "音频",
+        "result": "有声音" if c_audio else ("接近静音" if has_audio else "无音轨"),
+        "contribution": round(c_audio * 100, 1),
+        "detail": (f"平均音量 {audio_energy:.1f} dB" if audio_energy is not None
+                   else ("存在音轨但未做音量分析" if has_audio else "该摄像头不录音")),
+        "level": "keep" if c_audio else "neutral",
+    })
+
+    # ---- Step 2: noisy-OR 饱和聚合 → 内容分 0-100 ----
+    surv = 1.0
+    for c in (c_person, c_vehicle, c_animal, c_motion, c_audio):
+        if c > 0:
+            surv *= (1.0 - min(0.99, c))
+    content = round(100.0 * (1.0 - surv), 2)
+
+    # ---- Step 3: 质量乘数 ----
+    p = {}
+    penalty = 0.0
+    p["is_blurry"] = bool(fstats.get("is_blurry")) and float(
+        qual.get("w_blurry", 25))
+    p["is_low_light"] = bool(fstats.get("is_low_light")) and float(
+        qual.get("w_low_light", 20))
+    p["is_low_saturation"] = bool(fstats.get("is_low_saturation")) and float(
+        qual.get("w_low_sat", 10))
+    # 分辨率过低 = 远小目标的温床
+    w_low_res = float(qual.get("w_low_res", 15))
+    h = int(fstats.get("height") or 0)
+    p["is_low_res"] = (0 < h < int(qual.get("min_height", 480))) and w_low_res
+    p["is_tiny_person"] = (0 < st["person"]["area_max"] < float(
+        qual.get("tiny_area", 0.01))) and float(qual.get("w_tiny_person", 10))
+    p["is_single_frame_person"] = (st["person"]["frames"] == 1) and float(
+        qual.get("w_single_frame", 10))
+    cap = float(qual.get("penalty_cap", 45))
+    penalty = min(cap, sum(v for v in p.values() if v))
+    quality = round(100.0 - penalty, 2)
+    mult = float(qual.get("mult_floor", 0.5)) + (
+        1.0 - float(qual.get("mult_floor", 0.5))) * (quality / 100.0)
+    score = round(content * mult, 2)
+
+    # ---- 保底规则（Floor）与 Veto ----
+    # Floor 命中 ⇒ verdict 至少 review，**绝不 trash**。
+    # 它不制造积压：review 桶在 _PENDING_OR_TRASHED 的 B 分支 ⇒ 进 highlight_queue
+    # ⇒ 剪完由 _dispose_one 按 kept_ratio 自动定去留。"保底"不等于"等人"。
+    fl = qual.get("floor", {}) or {}
+    tiny = float(qual.get("tiny_area", 0.01))
+    # F0：**任何**一帧检出人物（conf ≥ 判定阈值）⇒ 至少 review，**绝不 trash**。
+    #
+    # 这条是全部 Floor 里最朴素也最硬的一条，理由只有一句：
+    # **"看到了人"就不该判"这里没有价值"。** 尤其在糊/夜视画面里，
+    # 远处一个小目标的检出更可能是真人而不是噪点 —— 这正是 L2.8 精华剪辑
+    # （8 倍采样密度重扫）存在的意义。Veto 绝不能取消它，否则
+    # "糊 + 远小 + 单帧"这个最典型的漏检场景会被判 trash 直接进回收目录。
+    floor = {
+        "F0_any_person": st["person"]["frames"] >= 1,
+        "F1_multi_frame_person": (st["person"]["frames"] >= 2
+                                  and st["person"]["conf_med"] >= float(
+                                      fl.get("f1_conf_med", 0.5))),
+        "F2_big_target": (st["person"]["conf_top"] >= float(fl.get("f2_conf", 0.6))
+                          and st["person"]["area_max"] >= float(
+                              fl.get("f2_area", 0.05))),
+        "F3_big_motion": motion >= float(fl.get("f3_motion", 0.15)),
+        "F4_weak_person": st["person"]["frames"] >= int(fl.get("f4_frames", 2)),
+        "F5_majority_person": st["person"]["persist"] >= float(
+            fl.get("f5_persist", 0.5)),
+        "F6_big_vehicle": (st["vehicle"]["conf_top"] >= float(fl.get("f6_conf", 0.7))
+                           and st["vehicle"]["area_max"] >= float(
+                               fl.get("f6_area", 0.05))),
+    }
+    # Veto：**只**取消弱保底 F4/F5 —— 它们靠"多帧/过半帧"这种**间接**证据，
+    # 而糊画面的帧间差异不可靠，多半是噪点抖动。
+    # F0/F1/F2/F3/F6 仍有效，其中 F0 更是任何情况下都不取消（见上）。
+    # 单向：只能取消弱保底，不能取消强保底。
+    veto = bool(
+        (fstats.get("is_blurry") and fstats.get("is_low_light"))
+        or (fstats.get("is_low_light") and fstats.get("is_low_saturation"))
+        or (fstats.get("is_blurry") and p.get("is_tiny_person"))
+    )
+    if veto:
+        floor["F4_weak_person"] = False
+        floor["F5_majority_person"] = False
+    strong = any(floor[k] for k in ("F0_any_person", "F1_multi_frame_person",
+                                    "F2_big_target", "F3_big_motion",
+                                    "F6_big_vehicle"))
+
+    # ---- 结论 ----
+    if score <= vd["trash_threshold"]:
+        verdict = "trash"
+    elif score < vd["review_threshold"]:
+        verdict = "review"
+    else:
+        verdict = "keep"
+    if verdict == "trash" and (strong or any(floor.values())):
+        verdict = "review"
+
+    hit = [k for k, v in floor.items() if v]
+    reasons.append({
+        "factor": "质量与一致性", "result": "已评估", "contribution": 0,
+        "detail": (f"内容分 {content:.1f} × 质量系数 {mult:.2f}（扣分 {penalty:.0f}："
+                   f"{'、'.join(k for k, v in p.items() if v) or '无'}）"
+                   + (f"；触发保底 {'、'.join(hit)}" if hit else "")
+                   + ("（画面质量差，弱保底已取消）" if veto else "")),
+        "level": "warn" if hit else "neutral",
+    })
+
+    summary = _summarize_v2(verdict, score, content, quality, st, floor, veto)
+    return {
+        "score": score,
+        "verdict": verdict,
+        "reasons": reasons,
+        "summary": summary,
+        "content_score": content,
+        "quality_score": quality,
+        "quality_penalty": round(penalty, 1),
+        "quality_mult": round(mult, 3),
+        "consistency": {g: st[g] for g in st},
+        "floor": {**floor, "veto": veto, "strong": strong},
+        "score_kind": "quality_v2",
+        "l1_version": "qv2",
+        "has_person": 1 if st["person"]["frames"] else 0,
+        "person_conf": round(st["person"]["conf_top"], 4) if st["person"]["frames"] else (
+            round(near.get("person", 0.0), 4) if "person" in near else 0.0),
+        "has_vehicle": 1 if st["vehicle"]["frames"] else 0,
+        "vehicle_conf": round(st["vehicle"]["conf_top"], 4) if st["vehicle"]["frames"] else 0.0,
+        "has_animal": 1 if st["animal"]["frames"] else 0,
+        "near_miss": {k: round(v, 4) for k, v in near.items()},
+    }
+
+
+def _summarize_v2(verdict, score, content, quality, st, floor, veto) -> str:
+    """质量分口径的结论文案。与 _summarize 分开写，避免两套口径混在一段话里。"""
+    hit = [k for k, v in floor.items() if v]
+    tail = f"（保底规则 {'、'.join(hit)} 生效）" if hit else ""
+    if verdict == "keep":
+        what = [g for g in ("person", "vehicle", "animal") if st[g]["frames"]]
+        return (f"内容分 {content:.1f} × 质量系数 → {score:.1f}，"
+                f"稳定检出 {'、'.join(what) or '有效内容'}，判定保留{tail}。")
+    if verdict == "review":
+        return (f"内容分 {content:.1f}、质量 {quality:.1f} → {score:.1f}，"
+                f"不足以判定保留，交给高密度重扫复核{tail}。")
+    return (f"内容分 {content:.1f}、质量 {quality:.1f} → {score:.1f}，"
+            f"画面无有效目标，判为环境干扰{('（' + ('糊且' if veto else '') + '弱信号已折价）' if veto else '')}。")
+
+
 def build_decision(
     detections_all: List[Dict],
     motion: float,
@@ -212,8 +499,45 @@ def build_decision(
     fstats: Dict,
     cfg: Dict,
     yolo_on: bool,
+    n_frames: int = 0,
 ) -> Dict[str, Any]:
-    """计算保留价值分，并生成完整的解释链。"""
+    """计算保留价值分，并生成完整的解释链。
+
+    scoring.mode = "quality_v2"（2026-10-04 起）走**质量分**口径：
+    多帧一致性 + noisy-OR 内容分 × 质量乘数 + 六条保底规则。
+    改 "legacy" 即回退到下面的旧公式，**不需要 git revert、不需要重跑分析**。
+
+    n_frames：实际抽到的帧数，是 `persist` 的分母。旧公式没有这个概念，
+    但 v2 的一致性判据离开它就没有意义（见 _class_stats 的说明）。
+    """
+    mode = str(cfg.get("scoring", {}).get("mode", "legacy") or "legacy")
+    if mode == "quality_v2":
+        thr = cfg["analysis"]["yolo_conf_threshold"]
+        raw_min = cfg["analysis"].get("yolo_keep_raw_above", 0.15)
+        return _score_quality_v2(
+            detections_all, motion, audio_energy, has_audio, fstats,
+            cfg, yolo_on, n_frames, thr, raw_min,
+        )
+    return _build_decision_legacy(
+        detections_all, motion, audio_energy, has_audio, fstats, cfg, yolo_on)
+
+
+def _build_decision_legacy(
+    detections_all: List[Dict],
+    motion: float,
+    audio_energy: Optional[float],
+    has_audio: bool,
+    fstats: Dict,
+    cfg: Dict,
+    yolo_on: bool,
+) -> Dict[str, Any]:
+    """**旧**公式（`scoring.mode = "legacy"`），原样保留作回滚出口。
+
+    只接受"过阈的单帧最高 conf"：一个人只在 1 帧被检出、和 15 帧全被检出，
+    得分完全一样；加上 person_weight=50 与 review_threshold=30，
+    conf ≥ 0.6 就直接 keep。保留这段是为了让 `mode` 切换能立刻对比，
+    不是为了继续用它。
+    """
     sc = cfg.get("scoring", {})
     vd = cfg.get("verdict", {})
     thr = cfg["analysis"]["yolo_conf_threshold"]
@@ -523,22 +847,36 @@ class Analyzer:
             all_dets: List[Dict] = []
             final_dets: List[Dict] = []
             if self.yolo_on:
-                for f in frames:
+                for fi, f in enumerate(frames):
                     fin, raw = self.detector.detect(f)
+                    # ★ 帧序号：质量分公式的 `persist`（一致性）与 `frames` 靠它。
+                    # 旧公式不需要帧维度，所以这里以前完全没有。
+                    for d in fin:
+                        d["frame"] = fi
+                    for d in raw:
+                        d["frame"] = fi
                     final_dets.extend(fin)
                     all_dets.extend(raw)
-                # 原始检出去重限流，避免 JSON 过大
+                # ⚠️ 截断**只影响写库的 raw_detections**，不能影响统计。
+                # 原来这里 `all_dets = all_dets[:60]` 之后才把 all_dets 交给
+                # build_decision —— 一帧 5 个检出就能把后面所有帧挤掉，
+                # 于是"多帧一致性"被系统性低估：单帧误检看起来像多帧确认。
+                # 现在统计用**完整**的 all_dets_full，落库仍限流。
+                all_dets_full = list(all_dets)
                 all_dets.sort(key=lambda d: -d["conf"])
                 all_dets = all_dets[:60]
+            else:
+                all_dets_full = []
             result["raw_detections"] = all_dets
 
-            # 打分 + 解释
+            # 打分 + 解释。v2 需要完整检出集（多帧一致性）+ 实际帧数（persist 分母）
             dec = build_decision(
-                final_dets if self.yolo_on else [],
+                all_dets_full if self.yolo_on else [],
                 motion,
                 row["audio_energy"] if row["audio_energy"] is not None else None,
                 bool(row["has_audio"]),
                 fstats, self.cfg, self.yolo_on,
+                n_frames=len(frames),
             )
             result.update(
                 retention_score=dec["score"], verdict=dec["verdict"],
@@ -546,6 +884,15 @@ class Analyzer:
                 person_conf=dec["person_conf"], has_vehicle=dec["has_vehicle"],
                 vehicle_conf=dec["vehicle_conf"], has_animal=dec["has_animal"],
             )
+            # v2 的新字段（legacy 模式下为 None，update_analysis 会跳过）
+            for _k in ("l1_version", "content_score", "quality_score",
+                       "person_frames", "person_persist", "person_area_max"):
+                result[_k] = dec.get(_k)
+            if dec.get("l1_version") is None:
+                result.pop("l1_version", None)
+            # final_score 与 retention_score 恒等，但它是**对外的判定结果**：
+            # 12 处 SQL 写 COALESCE(final_score, retention_score, 0)，selftest
+            # 也直接读它。保留是为了维持既有读取契约，不是维护第二套口径。
             result["final_score"] = dec["score"]
 
             if keep_thumb:

@@ -275,7 +275,8 @@ def current_subdir(trash_path: str, trash_root: str) -> str:
 def move_one(db, row, cfg: Dict, tier: str,
              log: Optional[Callable[[str], None]] = None,
              clips: Optional[List[Dict[str, Any]]] = None,
-             state: Optional[str] = None) -> Tuple[bool, str]:
+             state: Optional[str] = None,
+             by: str = "auto") -> Tuple[bool, str]:
     """移动单个文件到分级回收目录。返回 (成功, 消息)。
 
     clips：本次**新剪出**的产物清单。库里的 highlight_clips 也是对的了
@@ -283,6 +284,10 @@ def move_one(db, row, cfg: Dict, tier: str,
     state：覆写保全状态。不传（正常情况）则**回库取新鲜行**再判 —— 传进来的
     row 可能是剪辑前的旧快照，拿它判状态会把"刚剪完、只有 C 级"误判成
     "还没剪过"错放进 `待保全`（真实踩过一次）。
+    by：处置来源，写进 videos.decided_by。默认 'auto' —— 本函数绝大多数调用点
+    是机器（批量放行 / 剪辑自动处置 / 三堆对齐）；抽查页人工改判传 'human'。
+    **默认值是 'auto' 而不是 'human'**：默认值猜错的方向要选"把机器行为如实记下来"
+    那一侧，宁可让机器决策被记成 auto（可查），也不要把机器决策伪装成人工（不可查）。
     """
     src = Path(row["path"])
     trash_root = cfg.get("trash_root", "")
@@ -318,7 +323,8 @@ def move_one(db, row, cfg: Dict, tier: str,
     except Exception as e:  # noqa: BLE001
         return False, f"移动失败：{type(e).__name__}: {e}"
 
-    db.set_human_decision(row["id"], "trash", trash_path=str(dst), trash_tier=tier)
+    db.set_human_decision(row["id"], "trash", trash_path=str(dst), trash_tier=tier,
+                          decided_by=by)
     db.log_action(row["id"], "move", str(src), str(dst), row["batch_id"])
     if log:
         tag = f"［{subdir}］" if subdir else ""
@@ -329,7 +335,8 @@ def move_one(db, row, cfg: Dict, tier: str,
 def align_one(db, row, cfg: Dict,
               log: Optional[Callable[[str], None]] = None,
               pending_ids: Optional[set] = None,
-              verify: bool = True) -> Tuple[bool, str]:
+              verify: bool = True,
+              by: str = "auto") -> Tuple[bool, str]:
     """把**已经在**回收目录里的原片挪到它当前保全状态对应的子档（存量对齐）。
 
     与 move_one 的区别：源路径是 trash_path 而不是源盘的 path，且**不改处置结论**
@@ -338,6 +345,9 @@ def align_one(db, row, cfg: Dict,
 
     双向的：`已剪辑 → 待保全`（产物文件丢了/被清理了）和 `待保全 → 已剪辑`
     （补剪出了 A/B）都能走这里，所以它同时是「补跑保全之后再对齐一次」的入口。
+
+    by：处置来源，默认 'auto'（对齐是程序动作；抽查页改了 clips 后触发的那次
+    对齐也属程序动作，因为它是数据变更的必然结果而非人的判断）。
     """
     tp = row["trash_path"]
     if not tp:
@@ -370,7 +380,8 @@ def align_one(db, row, cfg: Dict,
     except Exception as e:  # noqa: BLE001
         return False, f"搬迁失败：{type(e).__name__}: {e}"
 
-    db.set_human_decision(row["id"], "trash", trash_path=str(dst), trash_tier=tier)
+    db.set_human_decision(row["id"], "trash", trash_path=str(dst), trash_tier=tier,
+                          decided_by=by)
     db.log_action(row["id"], "rehome", str(src), str(dst), row["batch_id"])
     if log:
         frm = f"「{have}」" if have else "档位目录"
@@ -379,8 +390,16 @@ def align_one(db, row, cfg: Dict,
     return True, str(dst)
 
 
-def undo_move(db, row, log: Optional[Callable[[str], None]] = None) -> Tuple[bool, str]:
-    """撤销一次移动，把文件移回原位。"""
+def undo_move(db, row, log: Optional[Callable[[str], None]] = None,
+              by: str = "human") -> Tuple[bool, str]:
+    """撤销一次移动，把文件移回原位。
+
+    by 默认 'human'（**与 move_one 相反**）：撤销的绝大多数触发是机主在审核动作
+    撤销 / 抽查页改判。机器也有一处会调它 —— highlighter._dispose_one 的
+    "已放行但精华占比过高 ⇒ 捞回" —— 那处**必须显式传 by='auto'**。
+    这里选 'human' 作默认是因为：漏传时人不会察觉（"我点的算我干的，对"），
+    而错记成 human 的代价是抽查页的"机器判得准不准"统计被污染。
+    """
     tp = row["trash_path"]
     if not tp or not Path(tp).exists():
         return False, "回收路径无效或文件已不存在"
@@ -392,7 +411,7 @@ def undo_move(db, row, log: Optional[Callable[[str], None]] = None) -> Tuple[boo
         shutil.move(tp, str(src))
     except Exception as e:  # noqa: BLE001
         return False, f"撤销失败：{type(e).__name__}: {e}"
-    db.set_human_decision(row["id"], "keep")
+    db.set_human_decision(row["id"], "keep", decided_by=by)
     db.log_action(row["id"], "undo", tp, str(src), row["batch_id"])
     if log:
         log(f"已撤销 {src.name}")

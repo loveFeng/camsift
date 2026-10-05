@@ -139,10 +139,10 @@ def record_feedback(db, row, human_verdict: str, cfg: Dict,
     ai_verdict = row["verdict"] or "trash"
     if human_verdict == ai_verdict:
         # 人与 AI 一致，不是误判，只记录处置
-        db.set_human_decision(row["id"], human_verdict)
+        db.set_human_decision(row["id"], human_verdict, decided_by="human")
         return {"is_misjudgment": False, "category": "agreed"}
 
-    db.set_human_decision(row["id"], human_verdict)
+    db.set_human_decision(row["id"], human_verdict, decided_by="human")
 
     # 只有"AI 判清理、人判保留"才是危险误判，需要归因
     if ai_verdict == "trash" and human_verdict == "keep":

@@ -62,7 +62,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # ---------------------------------------------------------------- 打分
     "scoring": {
-        "person_weight": 50,
+        # 判定口径版本。"quality_v2" = 多帧一致性 + noisy-OR 内容分 × 质量乘数
+        # + 六条保底规则（2026-10-04）；"legacy" = 旧公式，原样保留作回滚出口。
+        #
+        # 为什么值得切：旧公式 score = 50 × (单帧最高 conf)，review_threshold=30
+        # ⇒ **conf ≥ 0.6 直接 keep**；而 yolo_conf_threshold=0.4
+        # ⇒ [0.40, 0.60) 这条 0.22 宽的带子里所有真人全部误判 keep，
+        # 永不进任何队列、永不剪辑 —— highlighter 存在的意义被 L1 的判定废掉了。
+        # 改这一个值即可回退，不用 git revert、不用重跑分析。
+        "mode": "legacy",
+
+        "person_weight": 50,      # 以下四项仅 legacy 公式使用
         "vehicle_weight": 40,
         "animal_weight": 15,
         "motion_area_weight": 10,
@@ -72,6 +82,61 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 越响）。-50 dB 是实测下来"环境底噪"与"确实有动静"的分界。
         # （旧键 audio_energy_threshold 写的是 RMS 口径，与这里的 dB 对不上，已废）
         "audio_db_threshold": -50.0,
+
+        # ---- 以下五段仅 quality_v2 使用 ----
+        # 内容分权重：noisy-OR 饱和聚合，单项最大贡献 = w × conf × 1.0 × 1.0
+        "content": {
+            "w_person": 0.55,
+            "w_vehicle": 0.45,
+            "w_animal": 0.20,
+            # 动静/音频的权重必须**低于**最低 trash 阈值经过乘数后的值，
+            # 否则"只有动静无目标"仍然够线进 review —— 而这正是 v2 要消除的：
+            # 旧公式一次性 +10/+10，把大量环境误触发（树叶/光影/底噪）抬进 review，
+            # 审核桶因此充满噪声，误判归因的调参建议也就没意义了。
+            # 现值 0.06：trash_threshold=20 时需 quality≥1.0 才 12 分 < 20 ⇒ 落 trash。
+            "w_motion": 0.06,
+            "w_audio": 0.06,
+        },
+        # 多帧一致性：b_persist = persist_floor + (1-persist_floor) × min(1, persist/persist_full)
+        "consistency": {
+            "persist_floor": 0.6,   # 只出现 1 帧也保留 0.6 的加成 ——
+                                   # 单帧检出该进队列复核，不该直接判死
+            "persist_full": 0.4,    # 出现在 40% 以上的帧里即拿满一致性加成
+        },
+        # 尺寸因子：b_size = size_floor + (1-size_floor) × min(1, area_med/area_ref)
+        # 用**中位数**而非最大值：抗单帧大框误检
+        "size": {
+            "size_floor": 0.5,
+            "area_ref": {"person": 0.05, "vehicle": 0.08, "animal": 0.05},
+        },
+        # 质量扣分：penalty = min(cap, Σ命中项)，score = content × (mult_floor + ...)
+        "quality": {
+            "w_blurry": 25,
+            "w_low_light": 20,
+            "w_low_sat": 10,
+            "w_low_res": 15,
+            "min_height": 480,      # 低于此高度算"低分辨率"（远小目标的温床）
+            "w_tiny_person": 10,
+            "tiny_area": 0.01,      # 人体面积占比 < 1% 视为"远小"
+            "w_single_frame": 10,
+            "penalty_cap": 45,      # 扣分上限
+            "mult_floor": 0.5,      # ★ 质量乘数下界：最高打 5 折、**永不清零**。
+                                   # 用减法的话 max(0, 小内容−大扣分)=0 会直接落
+                                   # trash，等于"质量差否决内容" —— 语义错误。
+            # 保底规则：命中任一 ⇒ verdict 至少 review，绝不 trash。
+            # 不制造积压（review 桶在 _PENDING_OR_TRASHED 的 B 分支 ⇒ 进剪辑队列），
+            # "保底"不等于"等人"。
+            # F0 写死在代码里（任何一帧检出 person 就保底），不归此处配置 ——
+            # 它是本项目的底线语义，不该被一个配置项关掉。
+            "floor": {
+                "f1_conf_med": 0.5,   # F1 多帧 + 中位置信 ≥ 0.5
+                "f2_conf": 0.6, "f2_area": 0.05,   # F2 某帧清晰且够大
+                "f3_motion": 0.15,    # F3 大幅动静
+                "f4_frames": 2,       # F4 弱保底：多帧检出
+                "f5_persist": 0.5,    # F5 弱保底：过半帧出现
+                "f6_conf": 0.7, "f6_area": 0.05,   # F6 清晰大车
+            },
+        },
     },
 
     # ---------------------------------------------------------------- 结论
@@ -373,6 +438,38 @@ def _candidates(p: Path) -> list[Path]:
     return [c for c in out if c.exists() and c != p]
 
 
+def _warn_sample_frames(cfg: Dict[str, Any]) -> None:
+    """quality_v2 下 `sample_frames` 太低会让多帧一致性**静默失效**。
+
+    `persist = 检出帧数 / 实际抽到的帧数`。抽 6 帧时它只有 6 档分辨率 ——
+    "5/6 帧出现"和"1/6 帧出现"差异勉强够，但"2/6"与"2/12"完全不是一回事，
+    判据退化成噪声而**表面完全正常**（不报错、不告警，只是判得不准）。
+    这是比"跑不起来"更难发现的失效，所以在这里显式提示。
+
+    门限 12：低于它，连"1 帧 vs 3 帧"这种最粗的一致性区分都做不出来。
+    现状配置是 15，DEFAULT 是 6 —— 后者正是要防的那个坑。
+    """
+    if str(cfg.get("scoring", {}).get("mode", "legacy") or "legacy") != "quality_v2":
+        return
+    notes: List[str] = []
+    n = int(cfg.get("analysis", {}).get("sample_frames", 6) or 6)
+    if n < 12:
+        notes.append(f"每个片段只抽 {n} 帧 —— 多帧一致性判据会失效"
+                     f"（分数仍会算，但不可信），建议提到 12 以上（推荐 15）")
+    # ⚠️ 阈值必须随公式一起换，否则口径是错的
+    # 旧公式是「加法 125 分制」（50+40+15+10+10），trash_threshold=0 意味着
+    # "只有恰好 0 分才是 trash"；v2 是「质量分 0-100」且动静/音频权重已降到 0.06，
+    # 继续用 0 的话 trash 依然几乎不可达 —— "只有动静无目标"会卡在 12 分进 review，
+    # 而这正是 v2 要消除的噪声来源。
+    if float(cfg.get("verdict", {}).get("trash_threshold", 0) or 0) <= 0:
+        notes.append("verdict.trash_threshold 仍是 0（旧 125 分制的口径）—— "
+                     "换成 quality_v2 后 trash 几乎不可达，需重设三档阈值"
+                     "（起点参考：trash 20 / review 35 / release 20；"
+                     "实际值要用 scripts/audit_l1_quality.py 看真实分布再定）")
+    if notes:
+        _notice("打分口径 quality_v2：" + "；".join(notes) + "。")
+
+
 def load_config(path: Path | str | None = None) -> Dict[str, Any]:
     """加载配置。
 
@@ -385,11 +482,15 @@ def load_config(path: Path | str | None = None) -> Dict[str, Any]:
     p = Path(path) if path else CONFIG_PATH
 
     if not p.exists():
-        return _default()
+        d = _default()
+        _warn_sample_frames(d)
+        return d
 
     user_cfg = _read_json(p)
     if user_cfg is not None:
-        return _deep_merge(DEFAULT_CONFIG, user_cfg)
+        merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
+        _warn_sample_frames(merged)
+        return merged
 
     # ---- 配置损坏：隔离 + 恢复 ----
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

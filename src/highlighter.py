@@ -913,12 +913,22 @@ class HighlightCutter:
         if decision == "keep":
             return "not_disposed", "人工已保留，产物留底不处置"
 
+        # ⚠️ keep 桶的处置豁免（现在默认不生效，但**将来开 K1 之前必须先加这段**）：
+        # 若有人给 highlight_queue 加上 `verdict='keep'` 分支（"keep 也做删前保全"），
+        # 本函数会把整桶 keep 行自动移进回收目录 —— 而 keep 的语义是"有价值、别动它"，
+        # 那等于删除。开 K1 时必须在这里先判：
+        #     if row.get("verdict") == "keep":
+        #         return "keep_salvaged", "keep 桶只留精华不移动"
+        # 现在 keep 桶进不了 highlight_queue（谓词 db._PENDING_OR_TRASHED 只认
+        # 已移入回收 ∪ 未处置 trash/review），所以这段是先钉住约束，不是修 bug。
         auto = bool(self.cfg.get("highlight", {}).get("auto_dispose", True))
         keep_full = kr > kfr
 
         if decision == "trash" and keep_full:
-            # 已放行但整片都有内容 —— 0 分桶批量放行也可能误杀，机器捞回
-            ok, msg = undo_move(db, row, log)
+            # 已放行但整片都有内容 —— 0 分桶批量放行也可能误杀，机器捞回。
+            # by="auto" 必须显式传：undo_move 的默认是 'human'（撤销多数由人触发），
+            # 这里不传就会把机器捞回记成人工决策，污染抽查页的统计真源。
+            ok, msg = undo_move(db, row, log, by="auto")
             if ok:
                 if log:
                     log(f"↩ 撤销移动并保留（精华占比 {kr:.0%} > {kfr:.0%}）：{msg}")
@@ -930,7 +940,7 @@ class HighlightCutter:
 
         if decision is None:
             if keep_full:
-                db.set_human_decision(vid, "keep")
+                db.set_machine_decision(vid, "keep")
                 if log:
                     log(f"🟢 自动保留（精华占比 {kr:.0%} > {kfr:.0%}，整片都有内容）")
                 return "keep_full", f"精华占比 {kr:.0%} 过高，自动整片保留"

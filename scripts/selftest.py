@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -296,16 +297,29 @@ def test_jobs():
 
 # --------------------------------------------------------------------------- 7
 def test_hotkey_binding():
-    """快捷键靠按钮文案定位目标 —— 文案一改快捷键就静默失效，必须钉住。"""
-    section("快捷键 × 按钮文案一致性")
-    from src import hotkeys
+    """快捷键模块已**废弃**（v3 阶段 4）—— 这里改成反向断言钉住这件事。
+
+    为什么废弃：快捷键靠 `clickByText(indexOf)` 按**按钮文案**定位控件，
+    而 Streamlit 把**所有 tab 的内容都渲染进同一个 DOM**。于是
+    "在任意页按空格"都会去点审核台的「确认清理」—— 一个静默的跨页误触。
+    它的三层降级（components.html → iframe → pass）也让失效**毫无提示**。
+    原本它只查"文案还在不在"，查不出这个真 bug；程序全驱动之后人工只抽 N 条看，
+    快捷键的收益也趋近于 0。整模块删除（ADR 0007）。
+
+    保留这条测试是为了防止将来有人觉得"快捷键挺方便"又加回来 ——
+    那个坑是静默的，靠 review 发现不了。
+    """
+    section("快捷键模块已废弃（反向断言）")
     ui_src = Path("src/ui.py").read_text(encoding="utf-8")
-    labels = re.findall(r'st\.button\(\s*"([^"]+)"', ui_src)
-    for code, text, _desc in hotkeys.DEFAULT_KEYS:
-        hit = [l for l in labels if text in l]
-        check(bool(hit),
-              f"{hotkeys._LABELS.get(code, code)} → 「{text}」命中按钮"
-              + (f"：{hit[0]}" if hit else "（未找到，快捷键会失效）"))
+    check(not Path("src/hotkeys.py").exists(),
+          "src/hotkeys.py 不存在（模块已删）")
+    check("hotkeys" not in ui_src,
+          "ui.py 不再 import / 调用 hotkeys")
+    check("DEFAULT_KEYS" not in ui_src,
+          "没有残留的键位表引用")
+    # 反向：也不该再有"跳到第 N 条"这类全量审核导航（ADR 0005 的产物已退役）
+    check("rv_jump_idx" not in ui_src and "rv_jump_score" not in ui_src,
+          "全量审核的跳转控件已退役（改为抽查页的随机抽样）")
 
 
 # --------------------------------------------------------------------------- 8
@@ -495,84 +509,6 @@ def test_config_resilience():
 
 
 # --------------------------------------------------------------------------- 10
-def test_grid_select_all():
-    """批量浏览「全选本页 / 清空选择」机制（2026-09-05 修过的真实 bug）。
-
-    bug 根因：带 key 的复选框在首次渲染后，勾选态由 session_state["g_{id}"] 决定，
-    value= 参数只在组件首次实例化时生效。旧代码只改 selected 集合 → rerun 后
-    复选框仍按旧组件状态渲染 → elif 又把 id 从 selected 里 discard，等于没选。
-    正确做法：用 on_click 回调置位/复位组件状态（回调在脚本体执行前运行）。
-    """
-    section("批量浏览 全选/清空 机制")
-
-    # —— A. 源码接线检查：按钮必须挂在回调上，不能是「只改集合 + st.rerun」
-    ui_src = Path("src/ui.py").read_text(encoding="utf-8")
-    seg = ui_src[ui_src.index("def tab_grid"):]
-    sel_all = seg[seg.index('st.button("全选本页"'):][:200]
-    sel_clr = seg[seg.index('st.button("清空选择"'):][:200]
-    check("on_click=_grid_sel_all" in sel_all,
-          "「全选本页」通过 on_click 回调置位组件状态")
-    check("on_click=_grid_sel_clear" in sel_clr,
-          "「清空选择」通过 on_click 回调复位组件状态")
-    check("st.session_state[f\"g_{i}\"] = True" in ui_src,
-          "回调内直接写复选框组件状态 g_{id}")
-
-    # —— B. AppTest 行为验证：最小可运行脚本复刻同一套机制
-    app = r'''
-import streamlit as st
-
-st.session_state.setdefault("selected", set())
-IDS = [1, 2, 3]
-
-selected = st.session_state.selected
-for vid in IDS:
-    if st.checkbox("选择", key=f"g_{vid}", value=vid in selected):
-        selected.add(vid)
-    elif vid in selected:
-        selected.discard(vid)
-st.session_state.selected = selected
-
-
-def _sel_all(page_ids):
-    for i in page_ids:
-        st.session_state[f"g_{i}"] = True
-
-
-def _sel_clear():
-    for i in list(st.session_state.get("selected", set())):
-        st.session_state[f"g_{i}"] = False
-    st.session_state["selected"] = set()
-
-
-st.button("全选本页", on_click=_sel_all, args=(IDS,))
-st.button("清空选择", on_click=_sel_clear)
-st.write(f"已选 {len(selected)} 个")
-'''
-    from streamlit.testing.v1 import AppTest
-    import tempfile as _tf
-    app_file = Path(_tf.mkdtemp(prefix="grid_test_")) / "app.py"
-    app_file.write_text(app, encoding="utf-8")
-    try:
-        at = AppTest.from_file(str(app_file), default_timeout=10)
-        at.run()
-        check(not any(b.value for b in at.checkbox), "初始无勾选")
-        at.button[0].click()  # 全选本页
-        at.run()
-        ok_sel = all(b.value for b in at.checkbox)
-        check(ok_sel, "点击「全选本页」后本页全部勾选（旧代码此处失效）")
-        check("已选 3 个" in at.markdown[-1].value,
-              f"计数联动：{at.markdown[-1].value}")
-        at.button[1].click()  # 清空选择
-        at.run()
-        ok_clr = not any(b.value for b in at.checkbox)
-        check(ok_clr, "点击「清空选择」后全部复位（含组件状态）")
-        check("已选 0 个" in at.markdown[-1].value,
-              f"清空后计数归零：{at.markdown[-1].value}")
-    finally:
-        shutil.rmtree(app_file.parent, ignore_errors=True)
-
-
-# --------------------------------------------------------------------------- 11
 def test_audio_review():
     """音频复核层（L2.5）回归：DB 迁移/队列/复核写入/judge 解析/UI 接线。
 
@@ -689,11 +625,22 @@ def test_audio_review():
     ui_src = (Path(__file__).resolve().parent.parent / "src" / "ui.py").read_text(encoding="utf-8")
     jobs_src = (Path(__file__).resolve().parent.parent / "src" / "jobs.py").read_text(encoding="utf-8")
     check("def render_audio_card" in ui_src and "render_audio_card(row, cfg)" in ui_src,
-          "UI：审核台已挂载音频复核卡")
-    check("confirm_skip_audio" in ui_src and "disabled=not confirm_skip_audio" in ui_src,
-          "UI：确认清理带音频复核关口")
-    check("b_gate_ok" in ui_src and "disabled=(not selected or not b_gate_ok)" in ui_src,
-          "UI：批量移入带音频复核关口")
+          "UI：抽查页已挂载音频复核卡")
+    check("render_audio_card" in ui_src and "_grid_audio_html(row)" in ui_src,
+          "UI：音频摘要行也挂在抽查页（转写一眼可见）")
+    # ⚠️ 音频复核关口：旧审核台会 `disabled=not confirm_skip_audio`（硬拦），
+    # 抽查页**故意不拦、只提示**。理由：音频队列已放宽为「处置候选」，
+    # 移入回收后仍能补复核（review_one 有 trash_path 回落）⇒ 程序路径
+    # （_dispose_one / move_all）早已撤销同一道守卫；UI 再拦就是"半拦半不拦"，
+    # 会让一键执行的终点不可预期。这里钉死"有提示、不拦"。
+    check("有音轨但尚未音频复核" in ui_src,
+          "UI：抽查页对未音频复核的片段给提示")
+    # 只查**代码行**（注释里提到旧名字不算数 —— 注释里要解释清楚
+    # "为什么撤掉这道关口"，那些说明必须留着）
+    code_only = "\n".join(ln for ln in ui_src.splitlines()
+                          if not ln.strip().startswith("#"))
+    check("confirm_skip_audio" not in code_only and "b_gate_ok" not in code_only,
+          "★UI 不再有硬拦式音频关口（与程序路径同口径）")
     check('_AUDIO = "audio"' in jobs_src and "音频复核" in jobs_src
           and "start_audio_review" in jobs_src,
           "jobs：音频复核任务类型注册")
@@ -993,27 +940,24 @@ def _pcol(db):
 
 
 def test_grid_audio_text():
-    """批量浏览展示音频转写（2026-09-07）：格子内摘要 + 仅看检出人声筛选。
+    """音频转写摘要 HTML 的四种状态渲染（2026-09-07 引入，2026-10-04 换宿主）。
 
-    场景：画面被判删的片段，画外可能有人声事件。九宫格原来只显示「分数/档位/文件名」，
-    用户必须逐条点进审核台才能看到说了什么——等于把最关键的信息藏起来了。
+    场景：画面被判删的片段，画外可能有人声事件。转写摘要必须一眼可见 ——
+    让人逐条点进详情才看到「说了什么」，等于把最关键的信息藏起来。
+
+    ⚠️ 宿主已换：原实现挂在「批量浏览」九宫格上，该页已随全量审核导航一起删除
+    （ADR 0007）。`_grid_audio_html` 本身保留 —— 它的 CSS class 与四种状态分支
+    是可复用的资产，抽查页与未来的列表视图还会用到。下面的源码级断言改成
+    **反向**断言：钉住"旧的九宫格宿主不再存在"。
     """
-    section("批量浏览 音频转写展示")
+    section("音频转写摘要：四种状态渲染")
 
-    # 1) 源码接线：格子内必须渲染音频行，且受开关控制
     ui_src = Path("src/ui.py").read_text(encoding="utf-8")
-    seg = ui_src[ui_src.index("def tab_grid"):]
-    seg = seg[:seg.index("def tab_", 5)] if "def tab_" in seg[5:] else seg
-    check("_grid_audio_html(row)" in seg and "unsafe_allow_html=True" in seg,
-          "格子内渲染音频摘要行（HTML 片段）")
-    check('st.checkbox("🎧 显示音频转写", key="grid_show_audio")' in seg,
-          "提供「显示音频转写」开关（默认开）")
-    check('st.checkbox("仅看检出人声", key="grid_speech_only"' in seg
-          and "def _grid_filters" in ui_src and '"speech_only"] = True' in ui_src,
-          "提供「仅看检出人声」筛选，并入统一筛选字典")
-    check("db.count_review_queue(**fil)" in seg and "**fil)" in seg,
-          "筛选同时打进计数与分页查询（同一口径，防「显示 300 条、翻页却空」）")
-    check("st.markdown(_GRID_AUDIO_CSS" in seg, "注入格子音频摘要样式")
+    check("def tab_grid" not in ui_src,
+          "「批量浏览」页已删除（程序全驱动后只保留抽查）")
+    check("_grid_audio_html" in ui_src,
+          "_grid_audio_html 保留为可复用资产（不是随宿主一起删）")
+    check("_GRID_AUDIO_CSS" in ui_src, "格子音频摘要样式仍在")
 
     from src.ui import _grid_audio_html
 
@@ -1078,27 +1022,19 @@ def test_grid_video_play():
 
     红线复核：这些入口只能"打开"，绝不能删除/移动原文件。
     """
-    section("批量浏览 系统播放器入口")
+    section("系统播放器入口（路径探测）")
 
+    # ⚠️ 源码接线段改成反向断言：宿主「批量浏览」已删（ADR 0007），
+    # 下面的**行为**段（路径探测）才是真正要守的东西 —— 源/回收/两边都没有/
+    # 两边都在，四种情况的行为不能退化。
     ui_src = Path("src/ui.py").read_text(encoding="utf-8")
-    seg = ui_src[ui_src.index("def tab_grid"):]
-    seg = seg[:seg.index("def tab_", 5)] if "def tab_" in seg[5:] else seg
-
-    check('st.button("▶ 播放", key=f"p_{row[\'id\']}"' in seg,
-          "格子内「▶ 播放」按钮（按 id 唯一 key）")
-    check('st.button("📂 定位", key=f"f_{row[\'id\']}"' in seg,
-          "格子内「📂 定位」按钮（按 id 唯一 key）")
-    check("current_video_path(row)" in seg and "open_in_player(str(vp))" in seg,
-          "播放走 current_video_path 探测 + 系统播放器")
-    check(seg.count('st.error("原文件已不存在') >= 2,
-          "文件缺失时明确报错，不静默失败")
-    check('k.startswith(("g_", "p_", "f_"))' in seg,
-          "翻页残留键清理覆盖新增的播放/定位按钮键")
-    # 审核台同步：已移入回收目录的文件原本会被误报"不存在"
-    rev = ui_src[ui_src.index("def tab_review"):]
-    rev = rev[:rev.index("def tab_grid")]
-    check("vp = current_video_path(row)" in rev,
-          "审核台播放按钮同样走路径探测（移动后仍可播）")
+    check("def tab_grid" not in ui_src,
+          "「批量浏览」页已删除（播放器入口现存于抽查页与精华复核页）")
+    check("open_in_player" in ui_src and "reveal_in_explorer" in ui_src,
+          "系统播放器 / 资源管理器定位入口仍在（换宿主不丢功能）")
+    # 红线：这两个入口只能"打开"，绝不能移动/删除原文件
+    check("shutil.move" not in ui_src and "shutil.rmtree" not in ui_src,
+          "★ui.py 里没有移动/删除调用（红线：入口只能打开）")
 
     from src.ui import current_video_path, open_in_player, reveal_in_explorer
 
@@ -1227,32 +1163,46 @@ def test_review_queue_selfheal():
 
     seg2 = ui_src[ui_src.index("def tab_review"):]
     seg2 = seg2[:seg2.index("def tab_", 5)] if "def tab_" in seg2[5:] else seg2
-    check('row["verdict"] not in ("trash", "review")' in seg2,
-          "渲染前校验队列条目仍在审核范围")
-    check('"_q_reload"' in seg2 and "st.rerun()" in seg2,
-          "失效条目触发整页重载（自愈）")
+    # 队列 id 缓存 + "_q_reload" 自愈机制随全量审核队列一起退役（v3 阶段 4）：
+    # 抽查页的批次是**当场抽出来的一次性列表**，不缓存在 session_state 里
+    # 跨 rerun 复用，所以"条目过期"这个失效模式本身不存在了。
+    check("q_reload" not in ui_src and "_q_reload" not in ui_src,
+          "队列自愈机制已退役（抽查批次不跨 rerun 缓存，无过期可愈）")
+    check('row["verdict"] not in ("trash", "review")' not in seg2,
+          "旧的 verdict 范围校验也随之移除")
+    # 抽查页的等价保护：抽中的行取不到时必须优雅退出而不是 KeyError
+    check("if not row:" in seg2 and 'st.error("记录不存在")' in seg2,
+          "抽查页：行取不到时优雅退出（等价保护）")
 
-    # 行为级：把一条已被重置（verdict IS NULL）的真实 id 塞进缓存队列，页面必须不崩
+    # 行为级：把一条已被重置（verdict IS NULL）的 id 塞进抽查批次，页面必须不崩。
+    #
+    # ⚠️ 这里**不用项目真实库**，改用一次性临时库（靠 ui.main() 的
+    # VIDEO_SEARCH_DB_OVERRIDE 钩子注入路径）。自检脚本必须能在
+    # "data/ 尚未生成"时跑完 —— 新机首次装 / 库被清 / CI 都会遇到。
+    # 2026-10-04 真实库丢失时，这段直接 sqlite3.OperationalError 崩掉整个自检，
+    # 后面一百多项根本没执行。自检依赖真实库是设计错误，不是环境问题。
     from streamlit.testing.v1 import AppTest
-    cfg = load_config()
-    con = sqlite3.connect(cfg["runtime"]["sqlite_path"])
-    con.row_factory = sqlite3.Row
-    dead = con.execute(
-        "SELECT id FROM videos WHERE verdict IS NULL LIMIT 1").fetchone()
-    con.close()
-    if dead is None:
-        check(True, "（库中无已重置记录，跳过行为级复现）")
-        return
-    at = AppTest.from_file(str(Path("src/ui.py").resolve()), default_timeout=240)
-    at.session_state["queue"] = [dead["id"]]
-    at.session_state["q_page"] = 0
-    at.session_state["idx"] = 0
-    at.run()
-    check(not at.exception,
-          f"预置死 id {dead['id']} 后页面无异常（原崩溃场景已修复）")
-    q = list(at.session_state["queue"])
-    check(dead["id"] not in q and len(q) > 0,
-          f"队列已自愈刷新（{len(q)} 条有效 id，死 id 不再出现）")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="selftest-selfheal-"))
+    old_override = os.environ.get("VIDEO_SEARCH_DB_OVERRIDE")
+    try:
+        tmp_db = str(tmp_dir / "probe.db")
+        with Database(tmp_db).conn() as c:
+            c.execute("INSERT INTO videos (path, filename, verdict, meta_ok) "
+                      "VALUES ('dead.mp4','dead.mp4',NULL,1)")
+        os.environ["VIDEO_SEARCH_DB_OVERRIDE"] = tmp_db
+        at = AppTest.from_file(str(Path("src/ui.py").resolve()), default_timeout=240)
+        at.run()
+        check(not at.exception,
+              "空库（抽不到样本）时页面无异常 —— 抽查池为空是**正常状态**"
+              "（还没跑分析 / 口径不匹配），必须优雅提示而不是崩")
+        check(any("抽样池" in getattr(w, "value", "") for w in at.warning),
+              "抽样池为空时明确告知（机主能分辨是'没数据'还是'配置错了'）")
+    finally:
+        if old_override is None:
+            os.environ.pop("VIDEO_SEARCH_DB_OVERRIDE", None)
+        else:
+            os.environ["VIDEO_SEARCH_DB_OVERRIDE"] = old_override
+        shutil.rmtree(tmp_dir, ignore_errors=True)  # AUDIT-OK: 自创临时目录
 
 
 def test_review_jump_nav():
@@ -1289,77 +1239,78 @@ def test_review_jump_nav():
                   f"按分数定位的口径 x={x} → 位置 {db.count_review_below(x)}")
         check(db.count_review_below(100) == 8,
               "跳到分数 ≥100（无人达标）指向队列之后，由跳转逻辑夹回末尾")
+
+        # ---------- A2. 谓词参数收口（v3 阶段 2）----------
+        # max_score 是死参数、only_unreviewed 语义已反转，两者的形参都应从
+        # 签名里消失。留着它们会诱导调用点以为"能连已处置的一起看"——
+        # 而项目已程序驱动，抽查要看的正是已处置的结果。
+        import inspect
+        from src import db as DBMOD
+        for fn in (DBMOD.Database._review_sql, DBMOD.Database.review_queue,
+                   DBMOD.Database.count_review_queue,
+                   DBMOD.Database.count_review_below):
+            params = set(inspect.signature(fn).parameters)
+            check("max_score" not in params,
+                  f"{fn.__name__} 已删死参数 max_score")
+            check("only_unreviewed" not in params,
+                  f"{fn.__name__} 已删 only_unreviewed（语义已反转）")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
-    # ---------- B. 行为层：按需只加载目标页，越界夹住，换筛子回第一条 ----------
-    import types
-
-    from src import ui as U
-
-    class _FakeSS(dict):
-        """假 session_state：Streamlit 的 state 两种取值法（state.x / state["x"]）都得支持。"""
-
-        def __getattr__(self, k):
-            try:
-                return self[k]
-            except KeyError as e:
-                raise AttributeError(k) from e
-
-        def __setattr__(self, k, v):
-            self[k] = v
-
-    d2, db2, bid2, ids2 = _tmp_db(250)
-    saved_st = U.st
+    # ---------- A3. 已处置的行退出审核队列，但放行队列不受影响 ----------
+    # 独立 try 块：**这组断言会改库状态**（置 human_decision），放在上面那个
+    # 块里会让后续断言的基数凭空变化 —— 真实踩过（count_review_below 从 8 变 7，
+    # 报出三个"失败"）。
+    d3, db3, _b3, ids3 = _tmp_db(4)
     try:
-        for i, vid in enumerate(ids2):
-            db2.update_analysis(vid, {"status": "analyzed", "retention_score": i,
-                                      "verdict": "trash", "decision_trace": {}})
-        fake = types.SimpleNamespace(session_state=_FakeSS(),
-                                     toast=lambda *a, **k: None, rerun=lambda: None)
-        U.st = fake
-        fake.session_state.update({"q_page": 0, "idx": 0})
-        U._queue_ensure(db2, 100, {})
-        check(len(fake.session_state["queue"]) == 100, "初始只加载第一页 100 条")
-        U._queue_jump(db2, 150, 100, {})
-        check(fake.session_state["q_page"] == 1 and fake.session_state["idx"] == 50,
-              "跳到第 151 条 → 第 2 页第 51 格")
-        check(len(fake.session_state["queue"]) == 100,
-              "跳转只加载所在那一页，不拉全量队列")
-        U._queue_jump(db2, 99999, 100, {})
-        check(fake.session_state["q_page"] == 2 and fake.session_state["idx"] == 49
-              and len(fake.session_state["queue"]) == 50,
-              "越界跳转夹到最后一条（末页只有 50 条）")
-        U._queue_step(db2, 1, 100, {})
-        check(fake.session_state["idx"] == 49, "已在末尾时「下一条」原地不动")
-        fake.session_state["rv_min_score"] = 200.0
-        U._queue_ensure(db2, 100, U._queue_filters())
-        check(fake.session_state["q_page"] == 0 and fake.session_state["idx"] == 0,
-              "换了筛选条件：从第一条重载，而不是停在旧位置")
-        check(len(fake.session_state["queue"]) == 50,
-              "筛选后的队列按新口径只有 50 条")
+        for vid in ids3:
+            db3.update_analysis(vid, {"status": "analyzed", "retention_score": 5,
+                                      "final_score": 5, "verdict": "trash",
+                                      "has_person": 0, "decision_trace": {}})
+        with db3.conn() as c:
+            c.execute("UPDATE videos SET human_decision='trash' WHERE id=?",
+                      (ids3[0],))
+        check(ids3[0] not in [r["id"] for r in db3.review_queue(limit=99)],
+              "已处置的行不进审核队列（human_decision IS NULL 无条件生效）")
+        check(ids3[0] not in {r["id"] for r in
+                              db3.release_queue(limit=99, threshold=30,
+                                                require_no_person=False)},
+              "★放行队列仍只认未处置（release_queue 的独立谓词没被收口误伤）")
     finally:
-        U.st = saved_st
-        shutil.rmtree(d2, ignore_errors=True)
+        shutil.rmtree(d3, ignore_errors=True)
 
-    # ---------- C. UI 接线（源码级，防改后端忘挂控件） ----------
+    # ---------- B. UI 接线：全量审核导航已退役（反向断言）----------    # ADR 0005 的"跳到第 N 条 / 跳到分数 ≥X"是**全量人工审核时代**的导航。
+    # 程序全驱动之后人工只抽 N 条看，"跳到第 1500 条"没有使用场景 ——
+    # 连同批量浏览整页一起删除（ADR 0007）。保留反向断言防止有人又加回来：
+    # 那套导航一旦回来，就意味着"人工要逐条过"又回来了。
     ui_src = Path("src/ui.py").read_text(encoding="utf-8")
-    check("def _queue_jump" in ui_src and "db.count_review_queue(**filt)" in ui_src,
-          "审核台：跳转位置由同一组谓词算出（不自己扫队列）")
-    check('key="rv_jump_idx"' in ui_src and 'key="rv_jump_score"' in ui_src
-          and "count_review_below" in ui_src,
-          "审核台：条号跳转 + 分数跳转两个入口")
-    check("offset=page * size, **filt" in ui_src,
-          "队列分页查询透传筛选条件（只改显示不改查询=假筛选）")
-    check('key="grid_jump_page"' in ui_src and 'key="grid_first"' in ui_src
-          and 'key="grid_last"' in ui_src,
-          "批量浏览：页码跳转 + 首页/末页")
-    check("_queue_sig" in ui_src and "filt_changed" in ui_src,
-          "筛选条件指纹变化即重载（否则筛选后停在空页）")
-    check("**fil)" in ui_src and "def _grid_filters" in ui_src,
-          "批量浏览与审核台共用同一套筛选谓词（两页条目口径一致）")
+    for gone, why in (("def _queue_jump", "条号/分数跳转"),
+                      ("def _queue_ensure", "队列游标管理"),
+                      ("def _queue_sig", "筛选指纹"),
+                      ("def tab_grid", "批量浏览页"),
+                      ("rv_jump_idx", "条号跳转控件"),
+                      ("rv_jump_score", "分数跳转控件"),
+                      ("grid_jump_page", "九宫格页码跳转")):
+        check(gone not in ui_src, f"{why}已退役（{gone} 不存在）")
 
+    # ---- C. 抽查页替代了它 ----
+    check("def _spot_l1" in ui_src and "def _spot_clips" in ui_src,
+          "抽查页两个入口就位（L1 判定 / 已剪 A-B 精华）")
+    check("def _spot_sample_bar" in ui_src and "_spot_reroll" in ui_src,
+          "抽样工具条 + 换一批（种子+1，可回退）")
+    check("sample_ids" in ui_src and "sample_ab_clips" in ui_src,
+          "抽样走 db 层的可复现方法（不在 UI 里自己抽）")
 
+    # ---- D. 口径分叉的钉死（v3 阶段 2 留下）----
+    # ADR 0005 承诺"队列 / 计数 / 跳转三处逐字一致"。那套 UI 删了，但**原则留下**：
+    # 凡是"显示条数"的地方，都必须与"实际显示的集合"同口径。
+    # 现在抽查页承担这个角色 —— 抽样池的规模与实际抽出的样本必须一致。
+    empty_parens = [ln.strip() for ln in ui_src.splitlines()
+                    if "count_review_queue()" in ln]
+    check(not empty_parens,
+          f"无任何 count_review_queue() 空参调用（分母必须带筛选）：{empty_parens}")
+    check("count_sample_pool" in ui_src,
+          "抽查页用 count_sample_pool 报池规模（与 sample_ids 同谓词）")
 def test_coarse_suspect_kept():
     """Track C · C1（ADR 0006）+ hlv3：粗扫看到的检出要**一律**降级保留，不能丢。
 
@@ -1555,6 +1506,421 @@ def test_coarse_zero_hits_no_crash():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _q2_det(cls, conf, area, frame):
+    return {"class": cls, "class_id": 0, "conf": conf, "box": [0, 0, 10, 10],
+            "area_ratio": area, "frame": frame}
+
+
+_Q2_GOOD = {"width": 1280, "height": 720, "brightness": 80, "contrast": 50,
+            "blur_var": 300, "saturation": 60,
+            "is_low_light": False, "is_low_saturation": False, "is_blurry": False}
+
+
+def _q2_run(dets, motion=0.0, audio=None, has_audio=False, fstats=None,
+            mode="quality_v2", n_frames=15):
+    """跑一遍 build_decision。阈值按 mode 配套（口径不同，分数不可跨 mode 比）。"""
+    from src.analyzer import build_decision
+    from src.config import _default
+
+    cfg = _default()
+    cfg["scoring"]["mode"] = mode
+    cfg["analysis"]["yolo_conf_threshold"] = 0.4
+    if mode == "quality_v2":
+        # 质量分 0-100，单类内容分上限 0.55；动静/音频权重 0.06 ⇒ 各 6 分。
+        # trash 必须 > 6 才可能把"只有动静"判 trash；review 35 让清晰近人
+        # （实测 49.5）能进 keep，同时把远小的人（24.8）留在 review。
+        cfg["verdict"].update(trash_threshold=20, review_threshold=35,
+                              release_threshold=20)
+    return build_decision(dets, motion, audio, has_audio,
+                          fstats if fstats is not None else dict(_Q2_GOOD),
+                          cfg, True, n_frames=n_frames)
+
+
+def test_l1_quality_scoring():
+    """quality_v2 公式：多帧一致性 + noisy-OR 内容分（算例钉死）。"""
+    section("L1 · quality_v2 公式（质量分）")
+    P = _q2_det
+
+    # ---- 1. 修掉的核心漏洞：conf 0.6~1.0 一律 keep ----
+    d = [P("person", 0.62, 0.03, i) for i in (0, 3, 6, 9, 12)]
+    new, old = _q2_run(d), _q2_run(d, mode="legacy")
+    check(old["verdict"] == "keep",
+          f"旧公式：conf 0.62 直接 keep（{old['score']} 分）—— 这就是漏洞")
+    check(new["verdict"] == "review",
+          f"★新公式：同一段进 review（{new['score']} 分）")
+
+    # ---- 2. 清晰但远的人也不该一步 keep ----
+    d2 = [P("person", 0.75, 0.01, i) for i in range(8)]
+    check(_q2_run(d2, mode="legacy")["verdict"] == "keep"
+          and _q2_run(d2)["verdict"] == "review",
+          "清晰但远小的人：旧 keep → 新 review")
+
+    # ---- 3. 「只有动静」不再白送 10 分进 review ----
+    m_new, m_old = _q2_run([], motion=0.12), _q2_run([], motion=0.12,
+                                                      mode="legacy")
+    check(m_old["verdict"] == "review",
+          f"旧公式：只有动静 → review（{m_old['score']} 分）")
+    check(m_new["verdict"] == "trash",
+          f"★新公式：只有动静 → trash（{m_new['score']} 分）")
+
+    # ---- 4. 多帧一致性真的有区分度（旧公式完全没有）----
+    one = _q2_run([P("person", 0.75, 0.03, 7)])
+    many = _q2_run([P("person", 0.75, 0.03, i) for i in range(1, 9)])
+    check(many["score"] > one["score"],
+          f"8 帧检出比单帧高（{many['score']} > {one['score']}）")
+    check(_q2_run([P("person", 0.75, 0.03, 7)],
+                  mode="legacy")["score"]
+          == _q2_run([P("person", 0.75, 0.03, i) for i in range(1, 9)],
+                     mode="legacy")["score"],
+          "对照：旧公式下两者完全同分（分不出多帧）")
+
+    # ---- 5. 典型画面的判定 ----
+    cases = [
+        ("清晰近人 conf0.9 占比25% 10帧",
+         [P("person", 0.9, 0.25, i) for i in range(10)], {}, "keep"),
+        ("无人空景", [], {"motion": 0.01}, "trash"),
+        ("有声音但无目标", [], {"audio": -30, "has_audio": True}, "trash"),
+    ]
+    for tag, dets, opts, expect in cases:
+        r = _q2_run(dets, motion=opts.get("motion", 0.0), audio=opts.get("audio"),
+                    has_audio=opts.get("has_audio", False))
+        check(r["verdict"] == expect, f"「{tag}」⇒ {r['verdict']}（期望 {expect}）")
+
+    # ---- 6. mode 可回滚 ----
+    check(new.get("l1_version") == "qv2", "v2 写 l1_version='qv2'（抽查页据此过滤）")
+    check(old.get("l1_version") is None, "legacy 不写 l1_version")
+    check(old["verdict"] != new["verdict"],
+          f"同一段 legacy={old['verdict']} / v2={new['verdict']} ⇒ 可对比可回滚")
+
+
+def test_l1_floor_safety():
+    """保底规则（Floor）与 Veto：任何情况下不能把"有人"判成 trash。"""
+    section("L1 · quality_v2 保底规则与安全边界")
+    P = _q2_det
+    bad = dict(_Q2_GOOD, height=240, is_low_light=True, is_blurry=True,
+               is_low_saturation=True, brightness=20, blur_var=30, saturation=10)
+
+    # F0：任何一帧检出 person ⇒ 绝不 trash（哪怕糊 + 远小 + 单帧）
+    w = _q2_run([P("person", 0.42, 0.003, 2)], fstats=bad)
+    check(w["verdict"] != "trash",
+          f"糊+远小+单帧弱信号仍不判 trash（{w['score']} → {w['verdict']}）")
+    check(w["floor"]["F0_any_person"] is True, "F0（见到人）已触发")
+
+    # Veto 只取消弱保底
+    v = _q2_run([P("person", 0.8, 0.09, i) for i in (1, 2)], fstats=bad)
+    check(v["floor"]["veto"] is True, "糊+暗 ⇒ Veto 触发")
+    check(v["floor"]["F4_weak_person"] is False, "Veto 取消了弱保底 F4")
+    check(v["floor"]["F0_any_person"] is True,
+          "★Veto 绝不取消 F0 —— 见到人就不能判 trash")
+
+    # 质量乘数下界：质量再差也不清零
+    worst = dict(_Q2_GOOD, height=100, is_low_light=True, is_blurry=True,
+                 is_low_saturation=True)
+    w2 = _q2_run([P("person", 0.95, 0.5, i) for i in range(15)], fstats=worst)
+    check(w2["quality_mult"] >= 0.5,
+          f"质量乘数不低于 0.5（实得 {w2['quality_mult']}）")
+    check(w2["content_score"] > 0, f"内容分未清零（{w2['content_score']}）")
+    check(w2["verdict"] == "keep",
+          f"极端画质 + 强目标 ⇒ 仍 keep（{w2['verdict']}）")
+
+    # 质量维度真的进了判定（现状里 blur/低光/分辨率只是文案）
+    sharp = _q2_run([P("person", 0.7, 0.04, i) for i in range(4)])
+    blurry = _q2_run([P("person", 0.7, 0.04, i) for i in range(4)],
+                     fstats=dict(_Q2_GOOD, is_blurry=True, blur_var=30))
+    check(blurry["score"] < sharp["score"],
+          f"★同样检出，画面糊则分数更低（{blurry['score']} < {sharp['score']}）"
+          f"—— 旧公式下两者完全相同")
+
+
+def test_l1_mode_switch():
+    """`scoring.mode` 切换：配置层即可回滚，不需 git revert、不需重跑分析。"""
+    section("L1 · quality_v2 / legacy 模式切换")
+    import inspect
+
+    from src.analyzer import build_decision
+    from src.config import DEFAULT_CONFIG, _deep_merge, _default, _warn_sample_frames
+
+    check("mode" in DEFAULT_CONFIG["scoring"],
+          "DEFAULT_CONFIG.scoring 有 mode 键（缺省即 legacy）")
+    check(DEFAULT_CONFIG["scoring"]["mode"] == "legacy",
+          "默认仍是 legacy —— 切到 v2 是机主的显式决定")
+    for seg in ("content", "consistency", "size", "quality"):
+        check(seg in DEFAULT_CONFIG["scoring"],
+              f"scoring.{seg} 段存在（v2 专用参数）")
+    check("floor" in DEFAULT_CONFIG["scoring"]["quality"],
+          "scoring.quality.floor 保底规则可配")
+    check("mult_floor" in DEFAULT_CONFIG["scoring"]["quality"],
+          "scoring.quality.mult_floor —— 乘数下界（永不清零）可配")
+    # F0 写死在代码里，不该出现在配置里（它是底线语义，不该被配置关掉）
+    check("f0" not in str(DEFAULT_CONFIG["scoring"]["quality"]["floor"]).lower(),
+          "F0 不在配置里 —— 见到人就保底是底线，不给关")
+
+    # 缺配置时 load 能补齐（增删配置项不破坏旧配置，项目既有约定）
+    merged = _deep_merge(DEFAULT_CONFIG, {"scoring": {"person_weight": 99}})
+    check(merged["scoring"]["person_weight"] == 99
+          and "content" in merged["scoring"],
+          "旧配置 + 新默认值能合并（老 config.json 不会因新键失效）")
+
+    # sample_frames < 12 且 mode=qv2 ⇒ 给出告警（静默失效比崩溃更难发现）
+    import src.config as CFG
+    low = _default()
+    low["scoring"]["mode"] = "quality_v2"
+    low["analysis"]["sample_frames"] = 6
+    low["verdict"]["trash_threshold"] = 20
+    CFG.LAST_NOTICE = ""
+    _warn_sample_frames(low)
+    check("6 帧" in CFG.LAST_NOTICE,
+          f"抽帧 < 12 且用 v2 ⇒ 提示一致性会失效（{CFG.LAST_NOTICE[:40]}…）")
+
+    # 阈值没跟着换 ⇒ 也要提示（0 是旧 125 分制的口径，v2 下 trash 不可达）
+    th = _default()
+    th["scoring"]["mode"] = "quality_v2"
+    th["analysis"]["sample_frames"] = 15
+    th["verdict"]["trash_threshold"] = 0
+    CFG.LAST_NOTICE = ""
+    _warn_sample_frames(th)
+    check("trash_threshold" in CFG.LAST_NOTICE,
+          "v2 下 trash_threshold 仍为 0 ⇒ 提示重设阈值")
+
+    # legacy 模式不打扰
+    leg = _default()
+    leg["analysis"]["sample_frames"] = 6
+    CFG.LAST_NOTICE = ""
+    _warn_sample_frames(leg)
+    check(CFG.LAST_NOTICE == "", "legacy 模式不触发 v2 专属告警")
+
+    # build_decision 接受 n_frames（旧公式忽略它）
+    import inspect as _i
+    check("n_frames" in _i.signature(build_decision).parameters,
+          "build_decision 接受 n_frames（persist 的分母）")
+
+
+def _spot_seed_db(n: int = 60):
+    """造一个带 L1 行 + A/B 产物的临时库，供抽查相关测试用。"""
+    d = Path(tempfile.mkdtemp(prefix="spot-"))
+    db = Database(str(d / "t.db"))
+    with db.conn() as c:
+        for i in range(n):
+            v = ("keep", "review", "trash")[i % 3]
+            clips = ([{"grade": "A", "file": f"G:/h/a{i}.mp4", "dur": 9.0},
+                      {"grade": "B", "file": f"G:/h/b{i}.mp4", "dur": 4.0},
+                      {"grade": "C", "file": f"G:/h/c{i}.mp4", "dur": 5.0}]
+                     if i % 2 else [])
+            c.execute(
+                """INSERT INTO videos (path, filename, meta_ok, status, verdict,
+                   retention_score, l1_version, has_person,
+                   highlight_at, highlight_clips, ab_clips_count,
+                   highlight_best_grade, highlight_count)
+                   VALUES (?,?,1,'analyzed',?,?,?,?,?,?,?,?,?)""",
+                (f"G:/src/{i}.mp4", f"{i}.mp4", v, 25.0 + (i % 10),
+                 "qv2", 1 if v == "keep" else 0,
+                 "2026-10-05 10:00:00" if clips else None,
+                 json.dumps(clips, ensure_ascii=False) if clips else "[]",
+                 2 if clips else 0, "A" if clips else None,
+                 len(clips)))
+    return d, db
+
+
+def test_spotcheck_sampling():
+    """抽查抽样：可复现、跨层、不混口径、只取必要列。"""
+    section("抽查页：抽样可复现")
+    d, db = _spot_seed_db(60)
+    try:
+        # 1) 同 seed ⇒ 完全相同（这是抽查页存在的**前提**：
+        #    多人对齐口径、复查某条，都要求"同一批"能再抽出来）
+        a = [r["id"] for r in db.sample_ids(seed=42, n=10)]
+        b = [r["id"] for r in db.sample_ids(seed=42, n=10)]
+        check(a == b, f"同 seed 完全可复现（{a[:5]}…）")
+        c = [r["id"] for r in db.sample_ids(seed=43, n=10)]
+        check(set(a) != set(c) or len(a) < 3,
+              "换 seed 得到不同的样本（不是固定前 N 条）")
+
+        # 2) 跨层：三种 verdict 都能抽到（trash 层是 L1 漏洞最大处）
+        with db.conn() as cc:
+            allv = {r["id"]: r["verdict"] for r in cc.execute(
+                "SELECT id, verdict FROM videos").fetchall()}
+        got = {allv[i] for i in a}
+        check(len(got) >= 2, f"跨 verdict 分层（抽到 {sorted(got)}）")
+
+        # 3) ★只抽 l1_version='qv2'（旧公式的行混进来会把"公式不准"
+        #    与"样本不是这个公式判的"混为一谈）
+        with db.conn() as cc:
+            cc.execute("UPDATE videos SET l1_version=NULL WHERE id=?", (a[0],))
+        check(a[0] not in [r["id"] for r in db.sample_ids(seed=42, n=10)],
+              "★l1_version 为 NULL（legacy）的行不会被抽到")
+
+        # 4) 池规模与样本同口径（报"keep 层 20 条"却抽不出 keep 就是口径漂移）
+        pool = db.count_sample_pool()
+        check(pool["total"] == 59,
+              f"池规模与谓词一致（{pool}，l1_version=NULL 那条已排除）")
+        ids = [r["id"] for r in db.sample_ids(seed=7, n=200)]
+        check(len(ids) == 59, f"能抽满全池（{len(ids)} / 59）")
+
+        # 5) A/B 片段抽样：可复现 + 只取有 mp4 的 A/B
+        x = db.sample_ab_clips(seed=7, n=5)
+        y = db.sample_ab_clips(seed=7, n=5)
+        check([(i["video_id"], i["index"], i["grade"]) for i in x]
+              == [(i["video_id"], i["index"], i["grade"]) for i in y],
+              "A/B 片段抽样可复现")
+        check(all(i["grade"] in ("A", "B") and i.get("file") for i in x),
+              "A/B 抽样只含 A/B 级且有 mp4 的段")
+        check(all(i["grade"] != "C" for i in x), "C 级档案不进 A/B 抽样")
+        check(db.count_sample_pool_ab()["total"] == 60,
+              f"A/B 池规模（{db.count_sample_pool_ab()['total']} 段 = 30 条 × 2）")
+
+        # 6) 源码级：抽样不在 UI 里自己抽（口径会分叉）
+        ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+        check("random.sample" not in ui_src,
+              "UI 层不自己做抽样（统一走 db.sample_ids / sample_ab_clips）")
+        db_src = Path("src/db.py").read_text(encoding="utf-8")
+        db_code = "\n".join(ln for ln in db_src.splitlines()
+                            if not ln.strip().startswith("#"))
+        check("ORDER BY random()" not in db_code,
+              "★SQL 里没有 ORDER BY random()（无种子、rerun 就变、无法复现）"
+              "—— 注释里提到它是为了说明为什么不这么写")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_spotcheck_rejudge():
+    """抽查改判：保底不变量 + meta_ok=0 不许移走 + clips 派生列同步。"""
+    section("抽查页：即改判")
+    d, db = _spot_seed_db(4)
+    try:
+        with db.conn() as c:
+            ids = [r[0] for r in c.execute("SELECT id FROM videos LIMIT 2").fetchall()]
+        row = db.get_video(ids[0])
+        db.set_machine_decision(ids[0], "trash", trash_path="G:/need-del/x.mp4",
+                                trash_tier="A")
+
+        # 1) 改判「该留」⇒ trash_path/trash_tier 必须清空（硬不变量）
+        db.set_human_decision(ids[0], "keep", decided_by="human")
+        r2 = db.get_video(ids[0])
+        check(r2["trash_path"] is None and r2["trash_tier"] is None,
+              "★改判该留 ⇒ trash_path/trash_tier 恒为 NULL")
+        check(r2["decided_by"] == "human", "改判来源记为 'human'（与机器区分）")
+
+        # 2) 抽样页 UI 不该给 meta_ok=0 的行开「该删」
+        ui_src = Path("src/ui.py").read_text(encoding="utf-8")
+        seg = ui_src[ui_src.index("def _spot_actions"):]
+        seg = seg[:seg.index("\ndef ")] if "\ndef " in seg[3:] else seg
+        check("disabled=not is_meta_ok" in seg,
+              "★meta_ok=0（分析失败/解不开）的行「该删」被禁用 —— "
+              "那类行的 keep 是技术兜底，不是判定结论")
+        check('st.error("原文件已不存在")' in ui_src or
+              "原文件已不存在" in seg,
+              "文件缺失时明确报错")
+
+        # 3) ★改片段级别 ⇒ 派生列同步（否则「已剪辑」标记失真 ⇒
+        #    机主以为可删、实际 A 级 mp4 还在硬盘上）
+        with db.conn() as c:
+            rowv = c.execute(
+                "SELECT id FROM videos WHERE ab_clips_count>0 LIMIT 1").fetchone()
+        vid = rowv["id"] if rowv else None
+        if vid:
+            ok = db.set_clip_grade(vid, 0, "C")     # 把 A 级降成 C
+            check(ok, "set_clip_grade 可改级别")
+            r3 = db.get_video(vid)
+            check(r3["ab_clips_count"] == 1,
+                  f"★ab_clips_count 同步（A 降 C 后从 2 变 1，实得 {r3['ab_clips_count']}）")
+            check(r3["highlight_best_grade"] == "B",
+                  f"★highlight_best_grade 同步（A 降 C 后最高级变 B，"
+                  f"实得 {r3['highlight_best_grade']!r}）")
+            check("mover.align_one" in ui_src,
+                  "改级别后 UI 会调 align_one 把原片挪到正确子档")
+        # 4) 越界索引不得改坏数据
+        check(db.set_clip_grade(vid if vid else 0, 999, "A") is False,
+              "越界的片段索引被拒绝（返回 False 而不是写坏 JSON）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_decided_by():
+    """decided_by 溯源 + 决策留痕（v3 阶段 1 的固化）。"""
+    section("决策溯源：decided_by 与 decide:* 日志")
+    d, db, _b, ids = _tmp_db(3)
+    try:
+        with db.conn() as c:
+            v = c.execute("SELECT decided_by FROM videos WHERE id=?",
+                          (ids[0],)).fetchone()
+        check(v["decided_by"] is None,
+              "新行 decided_by 为 NULL（不是 'human' —— 否则机器决策被伪装成人工）")
+
+        db.set_machine_decision(ids[0], "trash", trash_path="G:/x.mp4",
+                                trash_tier="A")
+        with db.conn() as c:
+            v = c.execute("SELECT decided_by, human_decision FROM videos "
+                          "WHERE id=?", (ids[0],)).fetchone()
+            logs = [r["action"] for r in c.execute(
+                "SELECT action FROM action_log WHERE video_id=?", (ids[0],))]
+        check(v["decided_by"] == "auto", "set_machine_decision ⇒ 'auto'")
+        check(v["human_decision"] == "trash", "处置结论正确写入")
+        check("decide:trash" in logs,
+              f"★决策留痕在 set_human_decision 内部完成（{logs}）")
+
+        db.set_human_decision(ids[0], "keep", decided_by="human")
+        with db.conn() as c:
+            v = c.execute("SELECT decided_by, trash_path, trash_tier FROM videos "
+                          "WHERE id=?", (ids[0],)).fetchone()
+        check(v["decided_by"] == "human", "人工路径写 'human'")
+        check(v["trash_path"] is None and v["trash_tier"] is None,
+              "★不变量：keep ⇒ trash_path/trash_tier 恒为 NULL")
+
+        # 不传 decided_by 时不动该列（宁可不写也不猜）
+        db.set_human_decision(ids[1], "keep", decided_by="human")
+        db.set_human_decision(ids[1], "trash", trash_path="G:/y.mp4")
+        with db.conn() as c:
+            v = c.execute("SELECT decided_by FROM videos WHERE id=?",
+                          (ids[1],)).fetchone()
+        check(v["decided_by"] == "human", "不传 decided_by 时保留旧值（不猜默认值）")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ab_clips_count：只数 A/B 且有 mp4（与 mover.ab_clip_files 同判据）
+    d2, db2, _b2, ids2 = _tmp_db(1)
+    try:
+        clips = [
+            {"grade": "A", "file": "a.mp4"}, {"grade": "B", "file": "b.mp4"},
+            {"grade": "C", "file": "c.mp4"},          # C 不计
+            {"grade": "A", "file": None, "thumbs": ["x"]},   # 无 mp4 不计
+            {"grade": "C", "thumbs": ["y"]},                 # 只有静帧不计
+        ]
+        db2.mark_highlight(ids2[0], "t", 5, 19.0, clips, version="hlv3")
+        with db2.conn() as c:
+            v = c.execute("SELECT ab_clips_count, highlight_count, "
+                          "highlight_best_grade FROM videos WHERE id=?",
+                          (ids2[0],)).fetchone()
+        check(v["ab_clips_count"] == 2, f"ab_clips_count=2（实得 {v['ab_clips_count']}）")
+        check(v["highlight_count"] == 5, "highlight_count = len(clips)（含 C 段）")
+        check(v["ab_clips_count"] <= v["highlight_count"], "ab ≤ count（差额是 C 段）")
+    finally:
+        shutil.rmtree(d2, ignore_errors=True)
+
+    # reset_analysis 必须清掉 v2 六列 —— 否则改了公式重跑，抽查页会把
+    # 旧公式的行当新样本（l1_version 对得上、内容却是旧的）
+    d3, db3, _b3, ids3 = _tmp_db(1)
+    try:
+        db3.update_analysis(ids3[0], {
+            "status": "analyzed", "retention_score": 30, "verdict": "review",
+            "l1_version": "qv2", "content_score": 40.0, "quality_score": 100.0,
+            "person_frames": 5, "person_persist": 0.33, "person_area_max": 0.03,
+        })
+        with db3.conn() as c:
+            v = c.execute("SELECT l1_version, person_frames FROM videos "
+                          "WHERE id=?", (ids3[0],)).fetchone()
+        check(v["l1_version"] == "qv2" and v["person_frames"] == 5,
+              "update_analysis 写入 v2 六列")
+        db3.reset_analysis(scope="undecided")
+        with db3.conn() as c:
+            v = c.execute("SELECT l1_version, content_score, person_frames, "
+                          "person_persist, person_area_max FROM videos "
+                          "WHERE id=?", (ids3[0],)).fetchone()
+        check(all(v[k] is None for k in v.keys()),
+              f"★reset_analysis 清掉 v2 六列（否则改了公式重跑会抽到旧行）")
+    finally:
+        shutil.rmtree(d3, ignore_errors=True)
+
+
 def test_c_not_in_review():
     """Track C · C3：产物**只有 C 级**的视频是档案不是待办，默认不进人工队列。
 
@@ -1594,6 +1960,37 @@ def test_c_not_in_review():
         check(len(db.release_queue(limit=99, threshold=30,
                                    require_no_person=True)) == 3,
               "放行候选不受 hide_c_archive 影响（展示开关不参与处置判定）")
+
+        # ---- 修掉一个"曾经空转"的真实缺陷（2026-10-04，v3 阶段 2）----
+        #
+        # 旧判据只有 `COALESCE(highlight_best_grade,'') <> 'C'`。而**没剪过的行**
+        # best_grade 是 NULL，`NULL <> 'C'` 在 SQL 里恒为真 ⇒ 那些行照样留在队列。
+        # 这与"仅滤掉已剪出纯 C 档案"的本意不冲突，但真正的漏洞是：
+        # 历史行（剪辑在 best_grade 这一列出现之前）的 best_grade **全为 NULL**，
+        # 于是 `min(grades)` 算出来的值写不进去 —— 整条判据对存量数据**一条都没滤掉**。
+        # 现在判据加了 `highlight_at IS NULL OR ...` 分支，把"没剪"显式放行，
+        # 存量行（best_grade=NULL 但 highlight_at 非空）则落在 `'' <> 'C'` 为真的
+        # 那一侧 —— 与旧行为一致，不改变存量语义，只修好新写入的行。
+        with db.conn() as c:
+            c.execute("UPDATE videos SET highlight_best_grade=NULL WHERE id=?",
+                      (ids[1],))          # 模拟历史行：剪过但没记 best_grade
+        legacy = db.review_queue(limit=99, hide_c_archive=True)
+        check(ids[1] in [r["id"] for r in legacy],
+              "存量行（best_grade=NULL）不被误滤 —— 判据只对新写入的等级生效")
+        # 反向：新写入的纯 C 行必须被滤掉（这条是真断言，不是形式化）
+        db.mark_highlight(ids[1], "t", 2, 20.0,
+                          [{"grade": "C", "file": "c.mp4", "thumb": "c.jpg"}],
+                          sent=100, coarse_hits=3, version="hlv2")
+        again = db.review_queue(limit=99, hide_c_archive=True)
+        check(ids[1] not in [r["id"] for r in again],
+              "新写入的纯 C 档案被真正滤掉（判据已修复）")
+        # 未剪的行（highlight_at IS NULL）必须留在队列 —— 那是待办不是档案
+        with db.conn() as c:
+            c.execute("UPDATE videos SET highlight_at=NULL, "
+                      "highlight_best_grade=NULL WHERE id=?", (ids[1],))
+        pending_rows = db.review_queue(limit=99, hide_c_archive=True)
+        check(ids[1] in [r["id"] for r in pending_rows],
+              "未剪的行留在队列（highlight_at IS NULL 分支）")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -1968,6 +2365,14 @@ def test_highlight_batch():
         def mark_highlight_error(self, vid, msg):
             errs.append((vid, msg))
 
+        # 2026-10-04：_dispose_one 的自动保留改走 set_machine_decision（带
+        # decided_by='auto'）后，这个替身缺方法会 AttributeError。补上。
+        def set_machine_decision(self, vid, dec, *a, **kw):
+            pass
+
+        def set_human_decision(self, vid, dec, *a, **kw):
+            pass
+
     class _Cutter(H.HighlightCutter):
         """只 stub 掉耗时的检测/切割，保留 run_batch 的记账与写 manifest 逻辑。"""
 
@@ -2127,15 +2532,17 @@ def test_adr0001_cut_then_delete():
     calls = {"move": 0, "undo": 0, "keep": 0, "move_clips": None}
     _real = (M.move_one, M.undo_move, M.decide_tier)
 
-    def _fake_move(db, row, cfg, tier, log=None, clips=None):
+    def _fake_move(db, row, cfg, tier, log=None, clips=None, state=None, by="auto"):
         # clips 是「已剪辑」子档的落点依据 —— 处置链路必须把**本次新剪出**的产物
         # 传下来（row 里那份是剪辑前的旧快照）。这里顺带把它记下来做断言。
         calls["move"] += 1
         calls["move_clips"] = clips
+        calls["move_by"] = by
         return True, "fake-moved"
 
-    def _fake_undo(db, row, log=None):
+    def _fake_undo(db, row, log=None, by="human"):
         calls["undo"] += 1
+        calls["undo_by"] = by
         return True, "fake-undone"
 
     def _fake_tier(row, cfg):
@@ -2143,6 +2550,9 @@ def test_adr0001_cut_then_delete():
 
     class _DB:
         def set_human_decision(self, vid, dec, **kw):
+            calls["keep"] += 1
+
+        def set_machine_decision(self, vid, dec, **kw):
             calls["keep"] += 1
 
     dbx = _DB()
@@ -2199,6 +2609,11 @@ def test_adr0001_cut_then_delete():
         act, note = c._dispose_one(dbx, _row(human_decision="trash"), _r(0.85))
         check(act == "undo_keep" and calls["undo"] == 1,
               f"dispose：已放行但整片有内容 → 撤销移动捞回（{note}）")
+        # ★ decided_by 溯源：机器捞回必须记 'auto'。undo_move 的默认是 'human'
+        # （撤销多数由人触发），这里不显式传就会把机器行为伪装成人工决策，
+        # 抽查页"机器判得准不准"的统计真源被污染 —— 全项目最隐蔽的一个坑。
+        check(calls.get("undo_by") == "auto",
+              f"★机器捞回 undo_move(by='auto')（实得 {calls.get('undo_by')!r}）")
 
         # 落点依据必须是**本次新剪出**的 clips：row 里那份是剪辑前的旧快照，
         # 拿它判断会把刚剪出 A/B 的原片错放进普通档位（「已剪辑」标记就废了）
@@ -2255,12 +2670,17 @@ def test_adr0001_cut_then_delete():
     # ---------- E. UI 接线（源码级，防改 UI 忘接后端） ----------
     ui_src = Path("src/ui.py").read_text(encoding="utf-8")
     db_src = Path("src/db.py").read_text(encoding="utf-8")
-    check("_render_release_candidates(db, cfg)" in ui_src
-          and "def _render_release_candidates" in ui_src,
-          "UI：审核台页签顶部挂载「无人候选」放行卡（ADR 0003）")
-    check('一键放行' in ui_src and "mover.move_all(db, rows, cfg)" in ui_src
-          and "db.release_queue(" in ui_src,
-          "UI：放行按钮 → release_queue + move_all 全量放行")
+    check("_render_release_candidates" not in ui_src,
+          "★「一键放行」卡已从 UI 移除（v3 阶段 4）—— 放行是**程序动作**，"
+          "由一键执行自动跑；留在人工页上等于把机器该做的又交回给人")
+    check('一键放行' not in ui_src,
+          "UI 不再有「一键放行」按钮（能力保留在 jobs._run_release）")
+    # 放行的真实入口：一键执行的第 5 阶段
+    check("_run_release" in Path("src/jobs.py").read_text(encoding="utf-8")
+          and "release" in Path("src/jobs.py").read_text(encoding="utf-8"),
+          "jobs：放行保留在一键执行链路里（程序自动跑）")
+    check("move_all" in Path("src/mover.py").read_text(encoding="utf-8"),
+          "mover：move_all 仍是批量移动的原语")
     check("_PENDING_OR_TRASHED" in db_src
           and "human_decision IS NULL AND verdict IN ('trash','review')" in db_src,
           "db：archive/highlight 共用放宽后的处置候选谓词")
@@ -2430,7 +2850,6 @@ def main() -> int:
     test_no_delete_calls()
     test_model_verify_sizes()
     test_config_resilience()
-    test_grid_select_all()
     test_audio_review()
     test_archive()
     test_grid_audio_text()
@@ -2444,6 +2863,12 @@ def main() -> int:
     test_c_cut_mp4()
     test_coarse_zero_hits_no_crash()
     test_c_not_in_review()
+    test_l1_quality_scoring()
+    test_l1_floor_safety()
+    test_l1_mode_switch()
+    test_decided_by()
+    test_spotcheck_sampling()
+    test_spotcheck_rejudge()
     test_no_clip_split()
     test_rehighlight_idempotent()
     test_recycle_subdirs()

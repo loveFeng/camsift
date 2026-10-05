@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -99,9 +100,19 @@ CREATE TABLE IF NOT EXISTS videos (
 
     -- 人工处置
     human_decision   TEXT,
-    human_at         TEXT,
+    human_at         TEXT,           -- 处置时间（人工**或程序**；见 DECISION_COLUMNS 说明）
     trash_path       TEXT,
-    trash_tier       TEXT
+    trash_tier       TEXT,
+
+    -- 决策溯源与 L1 质量口径（见 DECISION_COLUMNS；老库由 _migrate 幂等补列）
+    decided_by       TEXT,
+    l1_version       TEXT,
+    content_score    REAL,
+    quality_score    REAL,
+    person_frames    INTEGER,
+    person_persist   REAL,
+    person_area_max  REAL,
+    ab_clips_count   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -145,6 +156,9 @@ CREATE INDEX IF NOT EXISTS idx_videos_year    ON videos(year);
 CREATE INDEX IF NOT EXISTS idx_videos_human   ON videos(human_decision);
 CREATE INDEX IF NOT EXISTS idx_videos_batch   ON videos(batch_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_cat   ON feedback(reason_category);
+-- 抽查页的抽样谓词走 l1_version；decided_by 用于"机器判的准不准"统计
+CREATE INDEX IF NOT EXISTS idx_videos_l1ver   ON videos(l1_version);
+CREATE INDEX IF NOT EXISTS idx_videos_bywho   ON videos(decided_by);
 """
 
 # 状态流转：pending -> metadata -> analyzed -> (reviewed/keep/trash)
@@ -196,6 +210,37 @@ HIGHLIGHT_COLUMNS: Dict[str, str] = {
     "highlight_best_grade": "TEXT",       # 产物里的最高级别（A>B>C）；仅 C = 纯档案
 }
 
+# 决策溯源 + L1 质量口径。老库在 init_db 时用 PRAGMA 检查后 ALTER TABLE 补齐。
+#
+# ⚠️ decided_by **绝不能给 DEFAULT 'human'** —— 项目已全面程序驱动
+# （highlighter._dispose_one / mover.move_all / release 批量放行都在写
+# human_decision），全填 'human' 会把上万条机器决策伪装成人工决策，
+# 抽查页"验证机器判得准不准"就失去了唯一的真源。NULL = 来源不明（历史数据）。
+#
+# ⚠️ 不加 decided_at：human_at 已经是"处置时间"（set_human_decision 每次都写），
+#    再加一列就是两列双写，reset_analysis / mover 任一处漏写就永久漂移。
+#
+# l1_version 是**判定口径版本**（'qv2' = 质量分公式），抽查页只抽它 ——
+# 旧公式的行混进样本会被误判成"新公式判错了"。改公式 = 换这个值，不是覆盖分数。
+#
+# l1_version / person_* 六列的写入方只有 analyzer.update_analysis；
+# reset_analysis 必须一并清掉（否则改了公式重跑，老行带着旧 l1_version
+# 但新分数，抽查页的版本过滤挡不住它们）。
+#
+# ab_clips_count 的写入方只有 mark_highlight（现算，不靠 UI 侧解析），
+# 是精华抽样与 hide_c_archive 的共同谓词来源。**不能被 reset_analysis 清**
+# —— 剪辑产物还在。
+DECISION_COLUMNS: Dict[str, str] = {
+    "decided_by": "TEXT",          # 'human' 人点的 / 'auto' 机器处置 / NULL 来源不明
+    "l1_version": "TEXT",          # 'qv2' 质量分公式；NULL = 旧公式（抽样时排除）
+    "content_score": "REAL",       # 0-100 内容分（noisy-OR 饱和聚合）
+    "quality_score": "REAL",       # 0-100 质量分（100 = 画面质量无扣分）
+    "person_frames": "INTEGER",    # 检出人的帧数（多帧一致性）
+    "person_persist": "REAL",      # person_frames / sampled_frames
+    "person_area_max": "REAL",     # 人体最大面积占比（远小判据）
+    "ab_clips_count": "INTEGER",   # A/B 级且有 mp4 的产物数（精华抽样谓词）
+}
+
 
 def _scope_sql(scope: str | None) -> str:
     """复核范围 → verdict 过滤 SQL 片段。默认 all（待清理 + 需人工确认）。"""
@@ -225,10 +270,10 @@ class Database:
             self._migrate(c)
 
     def _migrate(self, c) -> None:
-        """老库补齐新增列（音频复核 / 归档字段）。已存在则跳过，幂等安全。"""
+        """老库补齐新增列（音频复核 / 归档 / 精华 / 决策溯源）。已存在则跳过，幂等安全。"""
         existing = {r[1] for r in c.execute("PRAGMA table_info(videos)")}
         for col, decl in {**AUDIO_COLUMNS, **ARCHIVE_COLUMNS,
-                          **HIGHLIGHT_COLUMNS}.items():
+                          **HIGHLIGHT_COLUMNS, **DECISION_COLUMNS}.items():
             if col not in existing:
                 c.execute(f"ALTER TABLE videos ADD COLUMN {col} {decl}")
 
@@ -274,31 +319,54 @@ class Database:
             return c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
     def update_analysis(self, video_id: int, result: Dict[str, Any]) -> None:
+        """写入 L1 分析结果。
+
+        v2 的六列（l1_version / content_score / quality_score / person_frames /
+        person_persist / person_area_max）用**动态拼装**：只有 result 里带了才写。
+        这样 legacy 公式（不带这些键）走同一条路径也不会把老值清成 NULL ——
+        而"改了公式重跑"之后又应该被覆盖，靠的就是"带了就写"。
+
+        ⚠️ 不用 COALESCE 兜底：COALESCE(?, 旧值) 会让"重跑后新公式算出的
+        person_frames=0"（确实一帧没检出）被当成"没这个值"而保留旧数，
+        尺子就失真了。要写就写真值，不写就不碰。
+        """
         with self.conn() as c:
-            c.execute(
-                """UPDATE videos SET
-                     status=?, sampled_frames=?, has_person=?, person_conf=?,
-                     has_vehicle=?, vehicle_conf=?, has_animal=?, motion_area_ratio=?,
-                     raw_detections=?, frame_stats=?, retention_score=?, verdict=?,
-                     decision_trace=?, analyzed_at=?, analyze_error=?,
-                     final_score=?
-                   WHERE id=?""",
-                (
-                    result.get("status", STATUS_ANALYZED),
-                    result.get("sampled_frames"),
-                    result.get("has_person"), result.get("person_conf"),
-                    result.get("has_vehicle"), result.get("vehicle_conf"),
-                    result.get("has_animal"), result.get("motion_area_ratio"),
-                    json.dumps(result.get("raw_detections", []), ensure_ascii=False),
-                    json.dumps(result.get("frame_stats", {}), ensure_ascii=False),
-                    result.get("retention_score"), result.get("verdict"),
-                    json.dumps(result.get("decision_trace", {}), ensure_ascii=False),
-                    time.strftime("%Y-%m-%d %H:%M:%S"),
-                    result.get("analyze_error"),
-                    result.get("final_score", result.get("retention_score")),
-                    video_id,
-                ),
-            )
+            sets = [
+                "status=?", "sampled_frames=?", "has_person=?", "person_conf=?",
+                "has_vehicle=?", "vehicle_conf=?", "has_animal=?",
+                "motion_area_ratio=?", "raw_detections=?", "frame_stats=?",
+                "retention_score=?", "verdict=?", "decision_trace=?",
+                "analyzed_at=?", "analyze_error=?",
+            ]
+            args: List[Any] = [
+                result.get("status", STATUS_ANALYZED),
+                result.get("sampled_frames"),
+                result.get("has_person"), result.get("person_conf"),
+                result.get("has_vehicle"), result.get("vehicle_conf"),
+                result.get("has_animal"), result.get("motion_area_ratio"),
+                json.dumps(result.get("raw_detections", []), ensure_ascii=False),
+                json.dumps(result.get("frame_stats", {}), ensure_ascii=False),
+                result.get("retention_score"), result.get("verdict"),
+                json.dumps(result.get("decision_trace", {}), ensure_ascii=False),
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                result.get("analyze_error"),
+            ]
+            for col in ("l1_version", "content_score", "quality_score",
+                        "person_frames", "person_persist", "person_area_max"):
+                if result.get(col) is not None:
+                    sets.append(f"{col}=?")
+                    args.append(result[col])
+            # ⚠️ final_score **继续写**（2026-10-04 撤销过一次"删掉它"的决定）。
+            # 它与 retention_score 恒等，但它是**对外的判定结果**：
+            # 12 处 SQL 写 COALESCE(final_score, retention_score, 0)，
+            # selftest 也直接读它 —— 当初以为"两值永远相等所以冗余"，
+            # 实际删掉之后 COALESCE 会回落 retention_score（功能不变），
+            # 但**任何直接 SELECT final_score 的地方都会拿到 NULL**。
+            # 留着它不是维护两份口径，是维持既有读取契约。
+            sets.append("final_score=?")
+            args.append(result.get("final_score", result.get("retention_score")))
+            args.append(video_id)
+            c.execute(f"UPDATE videos SET {', '.join(sets)} WHERE id=?", args)
 
     def update_audio_review(self, video_id: int, r: Dict[str, Any]) -> None:
         """写入 L2.5 音频复核结果。r 内 None 字段不清空（只覆盖本次有值的）。"""
@@ -328,26 +396,63 @@ class Database:
     def set_human_decision(
         self, video_id: int, decision: str,
         trash_path: str | None = None, trash_tier: str | None = None,
+        decided_by: str | None = None,
     ) -> None:
-        """记录人工处置。decision: keep | trash
+        """记录处置。decision: keep | trash
 
         直写、**不继承旧值**：曾用 COALESCE(?, trash_path) 导致「撤销移动 → 改判
         keep」后 trash_path 仍残留，行同时带 keep 与失效回收路径，后续处置翻转时
         清单/空间统计会错报该文件在回收目录。现在维护硬不变量：
         human_decision='keep' ⇒ trash_path/trash_tier 恒为 NULL；
         human_decision='trash' 且未给路径 ⇒ 仅逻辑标记（文件仍在原位）。
+
+        decided_by: 'human'（人点的）/ 'auto'（机器处置）/ None（**不写该列**）。
+        宁可不写也不能猜默认值 —— 现有调用点里有人（抽查页、误判反馈）也有机器
+        （_dispose_one、批量放行、三堆对齐），猜错就污染了抽查统计的真源。
+        程序路径一律走 set_machine_decision，让"忘记传"变成可见的漏改。
+
+        **决策日志在这里无条件补记**（`decide:keep` / `decide:trash`）。此前靠每个
+        调用点记得调 log_action，而 highlighter._dispose_one 漏了 ⇒ 机器的
+        自动保留决策在操作历史里查不到。根因是"靠约定不靠机制"，这里把兜底
+        收到唯一真源。
+        ⚠️ 两个 INSERT 必须写在**同一个 with self.conn() 块**里 ——
+        log_action 自己开连接，SQLite 当前没开 WAL（见 conn()），批处理循环里
+        交替写同一张表会间歇性 database is locked。
         """
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
         with self.conn() as c:
+            sets = ["human_decision=?", "human_at=?", "status=?",
+                    "trash_path=?", "trash_tier=?"]
+            args: List[Any] = [
+                decision, ts,
+                STATUS_KEEP if decision == "keep" else STATUS_TRASH,
+                trash_path, trash_tier,
+            ]
+            if decided_by is not None:
+                sets.append("decided_by=?")
+                args.append(decided_by)
+            args.append(video_id)
+            c.execute(f"UPDATE videos SET {', '.join(sets)} WHERE id=?", args)
+            # 决策留痕。与 mover 的 move/rehome/undo 语义不同（那条记文件移动，
+            # 这条记处置决策），两者并存不重复。keep 没移动 ⇒ 路径给空串。
             c.execute(
-                """UPDATE videos SET human_decision=?, human_at=?,
-                   status=?, trash_path=?, trash_tier=?
-                   WHERE id=?""",
-                (
-                    decision, time.strftime("%Y-%m-%d %H:%M:%S"),
-                    STATUS_KEEP if decision == "keep" else STATUS_TRASH,
-                    trash_path, trash_tier, video_id,
-                ),
+                """INSERT INTO action_log (video_id, action, from_path, to_path, batch_id, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (video_id, f"decide:{decision}", "", trash_path or "", None, ts),
             )
+
+    def set_machine_decision(
+        self, video_id: int, decision: str,
+        trash_path: str | None = None, trash_tier: str | None = None,
+    ) -> None:
+        """机器处置（剪辑自动处置 / 批量放行 / 三堆对齐）。decided_by 恒为 'auto'。
+
+        独立方法而不是给 set_human_decision 加默认值参数：让「忘记传 decided_by」
+        在 review 时一眼可见，而不是静默写成 NULL（= 来源不明，抽查页会把它
+        归到"历史数据"里，从统计中消失）。
+        """
+        self.set_human_decision(video_id, decision, trash_path, trash_tier,
+                                decided_by="auto")
 
     def log_action(self, video_id: int, action: str,
                    from_path: str, to_path: str, batch_id: int | None = None) -> None:
@@ -503,6 +608,12 @@ class Database:
 
         只清 L1 分析产物；人工处置字段保留（那是人的决定，不因重分析而丢）。
         绝不触碰文件，也绝不删行。
+
+        ⚠️ 必须清掉 v2 的六列（2026-10-04 补）：漏清的话，改公式重跑之后
+        老行带着**上一版公式**的 `l1_version='qv2'` 但分数是新的 ——
+        而抽查页正是靠 `l1_version` 过滤"哪些行是当前公式产出的"。
+        版本号对了、内容却是旧公式的结果，抽查页会把它们当新样本，
+        得出的结论是错的。这是"改了公式重跑"这个最常做的操作必踩的坑。
         """
         if scope not in self.RESET_SCOPES:
             raise ValueError(f"未知 reset scope: {scope}")
@@ -514,7 +625,9 @@ class Database:
                 "has_animal=NULL, motion_area_ratio=NULL, raw_detections=NULL, "
                 "frame_stats=NULL, retention_score=NULL, verdict=NULL, "
                 "decision_trace=NULL, analyzed_at=NULL, analyze_error=NULL, "
-                "final_score=NULL WHERE " + where,
+                "final_score=NULL, l1_version=NULL, content_score=NULL, "
+                "quality_score=NULL, person_frames=NULL, person_persist=NULL, "
+                "person_area_max=NULL WHERE " + where,
                 [STATUS_METADATA] + args)
             n = cur.rowcount
         if batch_id:
@@ -561,14 +674,27 @@ class Database:
     # 审核队列的谓词只有一处定义 —— 队列、计数、跳转定位三者共用，
     # 否则"显示 1000 条但翻到第 3 页就空"这类口径漂移会反复出现
     # （count_audio_pending 就踩过：计数与队列谓词不一致，报 0 实际 2322）。
-    def _review_sql(self, only_unreviewed: bool = True, speech_only: bool = False,
+    #
+    # 参数收口（2026-10-04，v3 阶段 2）：8 个参数砍到 5 个。
+    #   - 删 max_score：全项目**零调用者**，纯死参数（grep 确认）。
+    #   - 删 only_unreviewed：`AND human_decision IS NULL` 改为无条件拼接。
+    #     项目已全面程序驱动，human_decision 由机器写（_dispose_one /
+    #     批量放行 / 三堆对齐），"只看待处置"对抽查页是**反需求** ——
+    #     抽查要看的正是机器已经处置完的结果。留着这个开关只会诱导调用点
+    #     以为能"连已处置的一起看"。注意 **release_queue 的
+    #     `human_decision IS NULL` 是它自己的谓词**（放行只认未处置），
+    #     不经过本函数，那一处**必须原样保留**。
+    #   - below_score 只被 count_review_below 用（跳转定位），保留。
+    def _review_sql(self, speech_only: bool = False,
                     person_only: bool = False, min_score: float | None = None,
-                    max_score: float | None = None,
                     below_score: float | None = None,
                     batch_id: int | None = None,
                     hide_c_archive: bool = False) -> tuple[str, List[Any]]:
         """审核队列的 WHERE 片段（含前导 AND）与参数。"""
-        sql = " AND human_decision IS NULL" if only_unreviewed else ""
+        # 处置状态：只列未处置的。已处置的行（机器放行 / 自动移入回收 /
+        # 自动整片保留）不再进待办 —— 它们的去留已由程序决定并记进
+        # decided_by + action_log（decide:*），要复查走抽查页而不是这里。
+        sql = " AND human_decision IS NULL"
         args: List[Any] = []
         if speech_only:
             sql += " AND audio_checked=1 AND speech_present=1"
@@ -579,13 +705,16 @@ class Database:
             # 它们已经剪完留底（Track C 生效后 C 级也出可播放 mp4），
             # 让人再逐条过一遍等于把"多留"变成"多看"，与减负相悖。
             # 只影响**列表展示**，不改放行/审核判定 —— 校验与处置逻辑一律不认这个开关。
-            sql += " AND COALESCE(highlight_best_grade, '') <> 'C'"
+            #
+            # ⚠️ 判据必须同时排除"还没剪过的行"：`highlight_best_grade` 在
+            # 剪完之前是 NULL，而 `NULL <> 'C'` 恒真 —— 早先只写后半句，
+            # 结果**一条都没滤掉**（待办 P1-7）。`highlight_at IS NULL` 那个
+            # OR 分支把"未剪"放行，与本意一致。
+            sql += (" AND (highlight_at IS NULL"
+                    " OR COALESCE(highlight_best_grade, '') <> 'C')")
         if min_score is not None:
             sql += " AND COALESCE(final_score, retention_score, 0) >= ?"
             args.append(float(min_score))
-        if max_score is not None:
-            sql += " AND COALESCE(final_score, retention_score, 0) <= ?"
-            args.append(float(max_score))
         if below_score is not None:
             sql += " AND COALESCE(final_score, retention_score, 0) < ?"
             args.append(float(below_score))
@@ -595,25 +724,24 @@ class Database:
         return sql, args
 
     def review_queue(self, batch_id: int | None = None, limit: int = 200,
-                     only_unreviewed: bool = True, offset: int = 0,
+                     offset: int = 0,
                      speech_only: bool = False, person_only: bool = False,
                      min_score: float | None = None,
-                     max_score: float | None = None,
                      hide_c_archive: bool = False) -> List[sqlite3.Row]:
         """审核队列：按最终分升序 —— 最可疑的排最前。offset 用于分页。
 
         speech_only=True 时只看「音频复核检出人声」的片段——画面被判删但画外
         可能有人声事件，清理前值得单独过一遍。
 
-        person_only / min_score / max_score 是审核台的定位筛子：分数升序下，
-        "跳到某个分数"等价于"数出有多少条低于它"，故 min/max 与跳转共用谓词。
+        person_only / min_score 是审核台的定位筛子：分数升序下，
+        "跳到某个分数"等价于"数出有多少条低于它"，故与 count_review_below 共用谓词。
 
         hide_c_archive=True 时滤掉「产物只有 C 级档案」的视频（Track C · C3）。
         """
         sql = ("SELECT * FROM videos WHERE verdict IN ('trash','review') AND meta_ok=1")
-        frag, args = self._review_sql(only_unreviewed=only_unreviewed,
-                                      speech_only=speech_only, person_only=person_only,
-                                      min_score=min_score, max_score=max_score,
+        frag, args = self._review_sql(speech_only=speech_only,
+                                      person_only=person_only,
+                                      min_score=min_score,
                                       batch_id=batch_id, hide_c_archive=hide_c_archive)
         sql += frag
         sql += " ORDER BY COALESCE(final_score, retention_score, 0) ASC, id ASC LIMIT ? OFFSET ?"
@@ -622,36 +750,195 @@ class Database:
             return c.execute(sql, args).fetchall()
 
     def count_review_queue(self, batch_id: int | None = None,
-                           only_unreviewed: bool = True,
                            speech_only: bool = False, person_only: bool = False,
                            min_score: float | None = None,
-                           max_score: float | None = None,
                            hide_c_archive: bool = False) -> int:
         sql = ("SELECT COUNT(*) FROM videos WHERE verdict IN ('trash','review') AND meta_ok=1")
-        frag, args = self._review_sql(only_unreviewed=only_unreviewed,
-                                      speech_only=speech_only, person_only=person_only,
-                                      min_score=min_score, max_score=max_score,
+        frag, args = self._review_sql(speech_only=speech_only,
+                                      person_only=person_only,
+                                      min_score=min_score,
                                       batch_id=batch_id, hide_c_archive=hide_c_archive)
         sql += frag
         with self.conn() as c:
             return c.execute(sql, args).fetchone()[0]
 
     def count_review_below(self, score: float, batch_id: int | None = None,
-                           only_unreviewed: bool = True,
                            speech_only: bool = False, person_only: bool = False,
                            hide_c_archive: bool = False) -> int:
         """队列里分数**低于** score 的条数 = 第一条「分数 ≥ score」的 0-based 位置。
 
         审核台按分数跳转靠它——别在 UI 里自己算，否则筛选条件一加就与队列错位。
+
+        形参与 count_review_queue 对称（min_score 在此为 below_score 语义，
+        两者不会同时传，所以不复用同一个形参名）。
         """
         sql = ("SELECT COUNT(*) FROM videos WHERE verdict IN ('trash','review') AND meta_ok=1")
-        frag, args = self._review_sql(only_unreviewed=only_unreviewed,
-                                      speech_only=speech_only, person_only=person_only,
+        frag, args = self._review_sql(speech_only=speech_only,
+                                      person_only=person_only,
                                       below_score=score, batch_id=batch_id,
                                       hide_c_archive=hide_c_archive)
         sql += frag
         with self.conn() as c:
             return c.execute(sql, args).fetchone()[0]
+
+    # ------------------------------------------------------------ 抽查页抽样
+    # 抽查是「程序全驱动」之后**唯一的人工入口**：不再是"必须逐条看过才能推进"，
+    # 而是"抽几条看看机器判得准不准"。于是抽样的三条纪律比筛选更重要：
+    #
+    # 1. **不写 `ORDER BY random()`**。SQLite 的 random() 每次调用都不同 ⇒
+    #    没有种子、rerun 就换一批、无法复现同一次抽查（多人对齐口径时这是硬伤）；
+    #    而且它是全表排序，3 万行时抽 10 条也要排 3 万行。
+    #    改在 Python 侧 `random.Random(seed).sample()` —— 与 release_queue /
+    #    count_release 里"SQL 粗筛 + Python 精筛"是同一套写法。
+    # 2. **只 SELECT 需要的列**。`raw_detections` 是几百 KB 的 JSON，
+    #    `SELECT *` 抽 10 条会拖出几 MB；`sample_ids` 只取 id/verdict。
+    # 3. **clips 绝不 LIKE JSON**。粗筛出候选行、Python 侧 json.loads 解析展开
+    #    —— 沿用 rehighlight_queue 已写下的铁律。
+    #
+    # 口径与"哪些行算样本"有关，必须与各处显示口径一致：
+    #   - 只抽 **l1_version = 'qv2'** 的行。旧公式判的行混进来会被误当成
+    #     "新公式判错了" —— 而判断公式好坏的前提是样本确实来自那个公式。
+    #   - 排除 **meta_ok=0**：那些行的 verdict='keep' 是"解不开就保留"的技术兜底，
+    #     不是判定结论，抽样看它没有意义。
+    def sample_ids(self, seed: int, n: int = 10, batch_id: int | None = None,
+                   l1_only: bool = True, l1_version: str = "qv2",
+                   ) -> List[sqlite3.Row]:
+        """按种子抽 n 条 id（可复现）。用于「L1 判定结果」抽查入口。
+
+        跨 verdict **分层抽样**（trash:review:keep 的配额由调用方算好后传 n，
+        本方法只保证"同一 seed 必得同一批"）。分层的原因：trash 桶的误判代价
+        最大（人已被机器处置），keep 桶则是 L1 漏洞最大的区（conf 0.4~0.6
+        全部误判 keep），两层都得抽到。
+        """
+        sql = ("SELECT id, verdict FROM videos WHERE meta_ok=1 "
+               "AND status='analyzed' AND verdict IN ('keep','review','trash')")
+        args: List[Any] = []
+        if l1_only:
+            sql += " AND l1_version=?"
+            args.append(l1_version)
+        if batch_id:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        with self.conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        if not rows:
+            return []
+        rnd = random.Random(int(seed))
+        return rnd.sample(list(rows), min(int(n), len(rows)))
+
+    def count_sample_pool(self, batch_id: int | None = None,
+                          l1_only: bool = True,
+                          l1_version: str = "qv2") -> Dict[str, int]:
+        """抽样池的各层规模（每层条数 + 总数）。
+
+        与 sample_ids **同一套谓词** —— 抽样池报"keep 层有 200 条"却抽不出 keep
+        样本，就是口径漂移，UI 上会显示成"配置错了"，比实际原因更难查。
+        """
+        sql = ("SELECT verdict, COUNT(*) n FROM videos WHERE meta_ok=1 "
+               "AND status='analyzed' AND verdict IN ('keep','review','trash')")
+        args: List[Any] = []
+        if l1_only:
+            sql += " AND l1_version=?"
+            args.append(l1_version)
+        if batch_id:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        out = {"keep": 0, "review": 0, "trash": 0, "total": 0}
+        with self.conn() as c:
+            for r in c.execute(sql + " GROUP BY verdict", args).fetchall():
+                out[r["verdict"]] = int(r["n"])
+                out["total"] += int(r["n"])
+        return out
+
+    def sample_ab_clips(self, seed: int, n: int = 10,
+                        batch_id: int | None = None,
+                        grades: tuple = ("A", "B")) -> List[Dict[str, Any]]:
+        """抽 n 个 A/B 级**片段**（不是视频）。用于「已剪精华」抽查入口。
+
+        按 clip 抽而不是按 video 抽：一条视频可能剪出 5 段，按视频抽会
+        让"剪得最多的那条"占掉大半样本，而那正是机器最自信的部分 ——
+        抽查要看的是**判断力最可疑的地方**，即 B 级（短、或边缘置信）。
+
+        返回 [{video_id, index, grade, ...clip 原字段}]，index 是 clips 里的
+        位置（改级别时要靠它定位）。
+        """
+        sql = ("SELECT id, highlight_clips, highlight_at FROM videos "
+               "WHERE highlight_at IS NOT NULL AND highlight_error IS NULL "
+               "AND ab_clips_count > 0")
+        args: List[Any] = []
+        if batch_id:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        with self.conn() as c:
+            rows = c.execute(sql, args).fetchall()
+
+        pool: List[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                clips = json.loads(r["highlight_clips"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            for i, clip in enumerate(clips):
+                if str(clip.get("grade") or "") in grades and clip.get("file"):
+                    pool.append({"video_id": r["id"], "index": i,
+                                 "highlight_at": r["highlight_at"], **clip})
+        if not pool:
+            return []
+        rnd = random.Random(int(seed))
+        return rnd.sample(pool, min(int(n), len(pool)))
+
+    def count_sample_pool_ab(self, batch_id: int | None = None,
+                             grades: tuple = ("A", "B")) -> Dict[str, int]:
+        """A/B 片段的抽样池规模（与 sample_ab_clips 同谓词）。"""
+        sql = ("SELECT id, highlight_clips FROM videos "
+               "WHERE highlight_at IS NOT NULL AND highlight_error IS NULL "
+               "AND ab_clips_count > 0")
+        args: List[Any] = []
+        if batch_id:
+            sql += " AND batch_id=?"
+            args.append(batch_id)
+        with self.conn() as c:
+            rows = c.execute(sql, args).fetchall()
+        n = 0
+        for r in rows:
+            try:
+                clips = json.loads(r["highlight_clips"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            n += sum(1 for x in clips
+                     if str(x.get("grade") or "") in grades and x.get("file"))
+        return {"total": n, "ab_clips": n}
+
+    def set_clip_grade(self, video_id: int, index: int, grade: str) -> bool:
+        """改某一段的级别，并**同步** highlight_best_grade 与 ab_clips_count。
+
+        为什么必须走这一个入口：mover.recycle_state() 靠 `has_ab_clip(clips)`
+        判「已剪辑」—— 改了 clips 却不重算那两个派生列，原片就会从「已剪辑」
+        落进顶层档位，于是**机主以为可删，实际 A 级 mp4 还在硬盘上**。
+        派生值一律现算，不允许调用方自己拼。
+        """
+        with self.conn() as c:
+            r = c.execute("SELECT highlight_clips FROM videos WHERE id=?",
+                          (video_id,)).fetchone()
+            if not r:
+                return False
+            try:
+                clips = json.loads(r["highlight_clips"] or "[]")
+            except (TypeError, ValueError):
+                return False
+            if not (0 <= int(index) < len(clips)):
+                return False
+            clips[int(index)]["grade"] = str(grade)
+            best = min((str(x.get("grade")) for x in clips if x.get("grade")),
+                       default=None)
+            ab = sum(1 for x in clips
+                     if str(x.get("grade") or "") in ("A", "B") and x.get("file"))
+            c.execute(
+                "UPDATE videos SET highlight_clips=?, highlight_best_grade=?, "
+                "ab_clips_count=?, highlight_count=? WHERE id=?",
+                (json.dumps(clips, ensure_ascii=False), best, ab, len(clips),
+                 video_id))
+        return True
 
     def count_audio_pending(self, batch_id: int | None = None,
                             only_unreviewed: bool = True,
@@ -884,6 +1171,14 @@ class Database:
                    default=None)
         sets.append("highlight_best_grade=?")
         args.append(best)
+        # A/B 级且**有 mp4** 的段数（与 mover.ab_clip_files 同一判据）。
+        # 现算而不靠 UI 侧解析：它是精华抽样谓词 + hide_c_archive 的共同来源，
+        # 与 highlight_best_grade 同一纪律 —— 只有一个写入点，三处不会分叉。
+        # 注意与 highlight_count 的差别：后者是 len(clips)（含只有静帧的 C 段）。
+        sets.append("ab_clips_count=?")
+        args.append(sum(1 for c in clips
+                        if str(c.get("grade") or "") in ("A", "B")
+                        and c.get("file")))
         for col, val in (("highlight_sent", sent),
                          ("highlight_coarse_hits", coarse_hits),
                          ("highlight_version", version)):
