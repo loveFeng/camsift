@@ -76,3 +76,20 @@ date: 2026-09-10
   "被筛选条件挡住了" —— 否则筛子把队列清空后，界面上没有入口把筛子摘掉。
 - **`_queue_load` / `_queue_step` / `_queue_jump` 都改为接收筛选字典**，
   新增队列维度时只改 `_queue_filters()` 与 `Database._review_sql()` 两处。
+
+---
+
+## 后续：本文的 UI 部分已被 ADR 0007 取代（2026-10-05）
+
+本文是**全量人工审核时代**的决策，那时的前提是"人要把几万条都过一遍"。
+项目转为程序全驱动后：
+
+- **`_queue_*` 8 个分页定位函数、`tab_grid` 整页、`rv_jump_idx` / `rv_jump_score`
+  跳转控件已删除** —— 抽查是"抽 N 条看"，"跳到第 1500 条"没有使用场景。
+- **但本文的核心原则留下了**：`Database._review_sql()` 作为谓词唯一真源、
+  队列 / 计数 / 定位三处共用。改口径时不要在 UI 里另拼 SQL
+  （`scripts/selftest.py` 有反向断言钉死"不再出现空参 `count_review_queue()`"）。
+- 原则的**新载体**是抽查页：`count_sample_pool` 必须与 `sample_ids` 共用谓词，
+  否则"池里 500 条"与"抽出 10 条里有 3 条不在池内"会同时发生。
+
+见 [ADR 0007](0007-spotcheck-driven-auto-dispose.md)。

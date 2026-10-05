@@ -8,10 +8,10 @@ Picks out **false-positive motion-detection clips** from surveillance footage an
 
 | Requirement | Where it lives |
 |------|---------|
-| Review videos on a web page | "Review Workbench" one-by-one (with hotkeys) + "Batch Browse" grid (paginated) |
+| Spot-check videos on a web page | "Spot Check" page — random sample of N items (two entry points, fixed seed for reproducibility, re-judge in place) |
 | Watch job execution | "Execution Progress" page (live panels for background tasks + batch progress + throughput/ETA) |
-| Why delete / why keep | Every item shows its **decision-evidence chain** (itemized scoring breakdown) |
-| Misjudgment attribution | Flag "misjudged — keep" and the system attributes the cause automatically, keeps the result on screen, and aggregates it on the "Misjudgment Analysis" page |
+| Why delete / why keep | Every item shows its **decision-evidence chain** (itemized scoring breakdown + which safety-floor rules fired) |
+| Misjudgment attribution | Click "log as misjudgment" while spot-checking and the system attributes the cause automatically, aggregating it on the "Misjudgment Analysis" page |
 | 🔊 Audio re-review | For delete candidates: extract audio track → voice detection (FSMN-VAD) → full transcript shown to you → LLM judges usefulness (Alibaba FunASR + ollama/qwen3). Prevents deleting clips where something happens off-camera |
 | 🎞 Highlight clipping | Before deletion, cuts out the few seconds where "something is actually happening on screen" (L2.8): two-level detection (coarse 3fps@640 + fine 4fps@1280), A/B/C grade outputs. Together with the speech archive this forms the last line of defense before deletion |
 | ⚡ One-click pipeline | Chains "scan → analyze → audio re-review → speech archiving → bulk release → highlight clipping → recycle-directory triage" into a single click, ending with the recycle directory ready (ADR 0004) |
@@ -62,13 +62,15 @@ cd <project dir>   # wherever you cloned this repo
    - `trash_root`: graded recycle directory (**must be on the same physical disk as the source**, otherwise moves are refused)
    - `work_dir`: local working directory (database/thumbnails, put it on SSD)
 2. Click **🔍 Start Scan (background)**, then **🤖 Start AI Analysis (background)**. Jobs run in the background; the panel below shows progress, speed, and ETA in real time. Click "Stop" anytime.
-3. **"Review Workbench"** — review one by one: thumbnails + evidence chain → confirm cleanup / flag as misjudged-keep
-   - Hotkeys: `Space` confirm cleanup　`Enter` misjudged-keep　`←` `→` navigate　`P` open in player　`V` generate web preview
-   - After flagging a misjudgment, the attribution result stays visible at the top of the page (it doesn't flash by)
-4. **"Batch Browse"** — paginated multi-select; after batch-moving to the recycle directory it **auto-generates a manifest CSV and space statistics**
-5. **"Highlight Review"** page — browse A/B products (C-grade is archival, safe to skip); the review workbench top bar has a **one-click release for "no-person" candidates**, backstopped by a highlight re-scan
-6. **"Misjudgment Analysis"** page — see the distribution of misjudgment causes and tuning suggestions
-7. Want it all in one go: the **"⚡ One-Click Pipeline"** at the top of "Settings & Scan" runs the full chain (including audio re-review + speech archiving + release + highlight clipping + recycle-directory triage); when it's done, the only thing left is you manually emptying the recycle directory
+3. **"Spot Check"** — pull 10 items and see whether the machine judged correctly (~2 min, recommended)
+   - Two entry points: 🎯 **L1 verdict** (stratified across keep/review/trash) and ✂️ **clipped A/B highlights** (sampled per *clip*, not per video)
+   - "🎲 Next batch" = seed + 1 (type the old seed back to return to a previous batch, so two reviewers can align on the same sample)
+   - Four actions: ✅ correct ｜ ⏪ **should keep (moves the original file back from the recycle directory to the source folder)** ｜ 🗑️ should delete ｜ 📝 log as misjudgment
+4. **"Highlight Review"** page — browse A/B products (C-grade is archival, safe to skip)
+5. **"Misjudgment Analysis"** page — see the distribution of misjudgment causes and tuning suggestions
+6. Want it all in one go: the **"⚡ One-Click Pipeline"** at the top of "Settings & Scan" runs the full chain (scan → analyze → audio re-review → speech archive → release → highlight clipping → recycle-directory triage); when it's done, the only thing left is you manually emptying the recycle directory
+   - **The stage order is not swappable**: speech archiving consumes the audio-review cache and must happen before the recycle directory is emptied; release must precede clipping (the reverse order makes release a no-op) — see ADR 0004
+7. Scoring parameters live in "Settings & Scan → 🎚 Scoring Parameters" (scoring mode / frames per clip / the three thresholds). **After changing them you must push the analyzed rows back to pending and re-run** for it to take effect
 
 > Want it to run automatically on boot? Double-click `开机自启-安装.bat` (starts 30 s after login). While jobs run, the program
 > automatically requests "prevent system sleep" — details in [docs/启动与使用指南.md](docs/启动与使用指南.md) §5.2 (in Chinese).
@@ -88,10 +90,9 @@ src/
   highlighter.py  highlight clipping: coarse + fine scan, A/B/C grades (L2.8)
   feedback.py   misjudgment attribution (re-examines raw detections, classifies causes, suggests tuning)
   mover.py      graded move + undo + manifest/space stats (contains no deletion of any kind)
-  jobs.py       background job manager (dedicated threads + progress + stop, process-level state)
-  hotkeys.py    keyboard hotkeys (injects JS that locates buttons by label text)
+  jobs.py       background job manager (dedicated threads + progress + stop + sleep inhibition, process-level state)
   cli.py        command-line entry (for running headless without the UI)
-  ui.py         Streamlit review workbench
+  ui.py         Streamlit workbench (spot check / highlight review / progress / misjudgment / settings)
 scripts/
   selftest.py        core-logic self-tests (regression; hundreds of assertions, incl. a code audit that src/ has no delete calls)
   smoke_ui.py        UI render smoke test (Streamlit AppTest runs the full page)
