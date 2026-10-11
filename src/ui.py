@@ -1666,12 +1666,21 @@ def _render_step_by_step(db, cfg, limit: int):
         st.error(f"⛔ {_p}")
     for _w in hlmod.check_warnings(cfg):       # 软提示：同盘风险，不阻止
         st.warning(f"💡 {_w}")
+    # 磁盘空间：硬闸门 —— 不足时不阻止启动按钮（由 run_batch 抛错），但先说清楚，
+    # 否则用户只会看到"启动失败"却不知道要先清空间。
+    _hl_no_room = hlmod.disk_block_reason(cfg)
+    if _hl_no_room:
+        st.error(f"⛔ {_hl_no_room}")
     _n_hl_pending = db.count_highlight_pending()
     _hl_stats = db.highlight_stats()
     st.caption(f"待剪辑：**{_n_hl_pending}** 段（含 review 桶）"
                f"　已出结果：**{_hl_stats['done']}** 段"
                f"（切出 {_hl_stats['clips']} 段 / {_hl_stats['secs'] / 60:.0f} 分钟）"
                f"　失败：**{_hl_stats['failed']}** 段")
+    _hl_free = hlmod.free_gib(hlmod.highlight_dir_of(cfg))
+    if _hl_free is not None:
+        st.caption(f"精华目录剩余空间：**{_hl_free:.1f} GiB**"
+                   f"（安全阈值 {hlmod.MIN_FREE_GIB:.0f} GiB）")
     if st.button("🎞 启动画面精华剪辑（后台）", use_container_width=True,
                  key="start_highlight",
                  disabled=busy or _n_hl_pending == 0 or bool(_hl_problems)):
@@ -1682,11 +1691,34 @@ def _render_step_by_step(db, cfg, limit: int):
 
     _n_hl_err = _hl_stats["failed"]
     if _n_hl_err:
-        if st.button(f"↩ 重置 {_n_hl_err} 条失败记录（重跑时再试）",
-                     key="reset_highlight_failed"):
-            n = db.reset_highlight("failed")
-            st.success(f"已重置 {n} 条失败记录。")
-            st.rerun()
+        # 失败行分两种，处理方式完全不同，不能只给一个"清 error"的按钮：
+        #  ① 零产物（highlight_count=0）—— 多半是磁盘满/中断这类**半成品**，
+        #     它的 highlight_at 与 highlight_version 已经写进去了，两条队列
+        #     都会把它挡在外面，光清 error 无效 ⇒ 必须用 failed_retry 整组退回。
+        #  ② 已有产物 —— 那不是"没剪完"，重跑只会浪费机时，让它在已剪辑里躺着。
+        #
+        # ⚠️ ①的按钮**不在这里** —— 它挪到了下面「🗂 回收目录三堆」卡片里。
+        # 理由：它的目的是让回收目录的「待保全」归零（那些原片删不得），属
+        # 回收目录的补救动作；挂在剪辑段里，机主从"为什么待保全不清零"查起
+        # 要翻过整段剪辑参数才能找到，方向是反的。
+        _n_retry = db.count_failed_retryable()
+        if _n_retry:
+            st.warning(
+                f"⚠️ {_n_retry} 条**零产物**的失败记录（多半是磁盘满或任务中断）"
+                "被挡在两条队列之外，光清 error 无效。"
+                f"**退回入口在下方「🗂 回收目录三堆」卡片里**"
+                f"（那里同时管着「待保全」这一堆 —— 退回来重剪就是为了让它归零）。")
+        if _n_hl_err > _n_retry:
+            with st.expander(f"其余 {_n_hl_err - _n_retry} 条失败记录（已有产物，非零产物）"):
+                st.caption(
+                    "这些行已经剪出过片段，**不占待重跑队列**（`highlight_count>0`）。"
+                    "若确实要连已有产物一起重来，用下面的「全部重来」—— 它会让全部已剪行"
+                    "重新排队，代价较大。")
+                if st.button("↩ 全部重来（所有已剪行重新排队）",
+                             key="reset_highlight_all"):
+                    n = db.reset_highlight("all")
+                    st.success(f"已重置 {n} 条。下次剪辑会全量重跑。")
+                    st.rerun()
 
     # —— Track C · C5 重剪：只针对「零产物 / 只剩静帧」这两类**症状** ——
     # 不做「全量重剪」是**取舍**，不是"重剪没用"：全量把版本落后但产物正常的行
@@ -1749,12 +1781,43 @@ def _render_step_by_step(db, cfg, limit: int):
                 f"| （留在档位目录） | {_n_plain} | 机器剪过、无 A/B 产物，**可直接删** |\n\n"
                 "**看产物**：产物名以原片名开头（`<原片名>_E01_A_时刻_秒数.mp4`），"
                 "复制原片名到精华目录里搜就能配上。")
+            _pr = _rec.get("pending_reasons") or {}
+            _r_never = _pr.get(mover.PEND_NEVER, 0)
+            _r_ver = _pr.get(mover.PEND_VERSION, 0)
+            _r_err = _pr.get(mover.PEND_ERROR, 0)
             if _n_hold:
+                # 三种成因的下一步完全不同，不能再写一句"先跑剪辑 + 重剪"的
+                # 万能话 —— 对磁盘满那批（N 条 error）那是**空动作**，它们两条
+                # 队列都进不去，开跑也剪不到。
+                _fix = []
+                if _r_never:
+                    _fix.append(
+                        f"**{_r_never} 条从没剪过**（在「画面精华剪辑」队列里排队）"
+                        + ("—— 磁盘空间够就会自动开跑" if not _hl_no_room
+                           else f" —— ⚠️ 但磁盘闸门正在拦着（{_hl_no_room}），"
+                                "先腾出空间再回来启动"))
+                if _r_ver:
+                    _fix.append(
+                        f"**{_r_ver} 条版本落后**（旧口径留下的漏检）"
+                        "→ 跑「按新口径重剪」")
+                if _r_err:
+                    _fix.append(
+                        f"**{_r_err} 条剪到一半炸了**（多半是磁盘满）"
+                        "→ 点下面「↩ 退回 N 条零产物失败记录」再重跑；"
+                        "**光刷新页面没用**，它们的时间戳已写入，两条队列都不再收它们")
                 st.warning(
                     f"⚠️ `{mover.PENDING_SUBDIR}` 里还有 **{_n_hold}** 条没剪完 —— "
-                    "它们的精华此刻还在原片里。**先跑完「画面精华剪辑」+「按新口径重剪」，"
-                    "再回来点下面的「对齐子档」**，这一堆会自然清空；"
+                    "它们的精华此刻还在原片里，一个都别删。\n\n- "
+                    + "\n- ".join(_fix)
+                    + "\n\n处理完再点「📦 对齐子档」，这一堆会自然清空。"
                     "在它归零之前，不要清空回收目录。")
+            if _n_fix:
+                st.info(
+                    f"📦 另有 **{_n_fix}** 条**已经处理完了、只是还待在错误的子档里**"
+                    "（精华已落袋 / 已确认无产物）。这些不用再剪，"
+                    "点「📦 对齐子档」搬到位即可。"
+                    + ("（其中待保全为 0 —— 说明这一堆是纯归位问题。）"
+                       if _n_hold == 0 else ""))
             _c1, _c2, _c3 = st.columns(3)
             if _c1.button(f"📦 对齐子档（{_n_fix} 条待归位）",
                           use_container_width=True, key="align_subdirs",
@@ -1781,6 +1844,26 @@ def _render_step_by_step(db, cfg, limit: int):
                         reveal_in_explorer(str(_d))
                     else:
                         st.warning(f"目录还不存在：{_d}（先点左边的「对齐子档」）")
+
+            # 「零产物失败记录退回」放在这儿而不是剪辑段：它的**唯一目的**是让
+            # 这些原片重新变成「可剪」从而让待保全那一堆归零 —— 也就是说它是
+            # 回收目录的补救动作，不是剪辑参数的一部分。原先挂在剪辑段里，
+            # 找它的人从"待保全为什么不清零"查起，翻到剪辑段才知道要往回收
+            # 目录这一张卡片走，反了。
+            _n_retry = db.count_failed_retryable()
+            if _n_retry:
+                st.markdown("---")
+                st.error(
+                    f"⛔ **{_n_retry} 条零产物失败记录卡在队列外**（多半是磁盘满或任务中断）。"
+                    "它们的时间戳与版本都已写入，两条队列都不会再收走 ⇒ "
+                    "**不退回就永远剪不到，`待保全` 也永远归不了零**。"
+                    + (f"其中 {min(_r_err, _n_retry)} 条还在回收目录里，就是上面那个"
+                       f" `{mover.PENDING_SUBDIR}`。" if _r_err else ""))
+                if st.button(f"↩ 退回 {_n_retry} 条零产物失败记录（可重剪）",
+                             key="reset_highlight_failed_retry"):
+                    n = db.reset_highlight("failed_retry")
+                    st.success(f"已退回 {n} 条，现在可以「启动画面精华剪辑」重跑。")
+                    st.rerun()
 
     st.divider()
     st.markdown("##### 导出清单")

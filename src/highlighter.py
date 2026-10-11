@@ -146,6 +146,44 @@ def check_warnings(cfg: Dict[str, Any]) -> List[str]:
     return same_drive_warnings(highlight_dir_of(cfg), cfg, "精华目录")
 
 
+# 批次开始时要求精华目录所在盘至少剩这么多（GiB）。
+# 实测（2026-10-08）：磁盘满会发生在 mark_highlight() 之后 ⇒留下
+# "highlight_at 非空 + version 已是目标值 + clips 为空 + error 非空" 的半成品行，
+# 两条剪辑队列都会把它们挡在外面，程序自己再也捞不回来（实测 530 条）。
+# 预检的意义就是**别开始跑**：宁可整批不动，也不要产出一批捞不回来的行。
+MIN_FREE_GIB = 8.0
+
+
+def free_gib(path: Path) -> Optional[float]:
+    """所在盘剩余空间（GiB）；取不到返回 None（不因此拦住任务）。"""
+    try:
+        p = Path(path)
+        probe = p if p.exists() else p.parent
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return shutil.disk_usage(str(probe)).free / 2 ** 30
+    except Exception:  # noqa: BLE001 取不到就当"不检查"，绝不因此中断
+        return None
+
+
+def disk_block_reason(cfg: Dict[str, Any]) -> Optional[str]:
+    """磁盘空间不足时给出**阻止**理由；够则返回 None。
+
+    与 check_warnings 的分工：那边是"同盘"这类提醒，不拦；这里是硬闸门 ——
+    空间不足时跑下去必然中途炸盘，而炸盘留下的半成品行程序收不回来。
+    """
+    free = free_gib(highlight_dir_of(cfg))
+    if free is None:
+        return None
+    if free < MIN_FREE_GIB:
+        return (f"精华目录所在盘仅剩 {free:.1f} GiB，低于安全阈值 "
+                f"{MIN_FREE_GIB:.0f} GiB —— 已阻止开跑。"
+                f"中途磁盘写满会留下「时间戳已写入、产物为空」的半成品行，"
+                f"两条剪辑队列都会把它挡在外面，程序再也捞不回来。"
+                f"请先清理空间再启动（阈值常量 highlighter.MIN_FREE_GIB 可调）。")
+    return None
+
+
 # --------------------------------------------------------------------------- 工具
 def parse_shot_time(stem: str) -> Optional[datetime]:
     """从文件名解析拍摄时刻 —— 给片段打上真实时间，家庭影像留念很值钱。"""
@@ -777,6 +815,12 @@ class HighlightCutter:
         if problems:
             raise HighlightError("；".join(problems))
 
+        # 磁盘硬闸门：空间不足就别开跑。跑到一半写满会留下捞不回来的半成品行
+        # （highlight_at 非空 + version 已是目标值 ⇒ 两条队列都收不到它）。
+        _no_room = disk_block_reason(self.cfg)
+        if _no_room:
+            raise HighlightError(_no_room)
+
         hdir = highlight_dir_of(self.cfg)
         hdir.mkdir(parents=True, exist_ok=True)
         if rehighlight:
@@ -794,6 +838,7 @@ class HighlightCutter:
                     "not_disposed": 0}
         manifest = hdir / MANIFEST_NAME
         errors: List[str] = []
+        disk_stopped_at = 0          # 因空间不足中止时的进度（0 = 未触发）
 
         with manifest.open("a", encoding="utf-8") as mf:
             for i, row in enumerate(rows, 1):
@@ -801,6 +846,19 @@ class HighlightCutter:
                     if log:
                         log("精华剪辑已中断")
                     break
+                # 批次中途兜底复查：开跑时有空间，不等于跑到第 800 条时还有。
+                # 每 20 条查一次（disk_usage 很便宜），低于阈值就停下**并把剩下的
+                # 留在队列里** —— 留在队列里就是干净状态，下次空间够了接着跑；
+                # 硬跑下去才会留下捞不回来的半成品行。
+                if i % 20 == 1:
+                    _low = disk_block_reason(self.cfg)
+                    if _low:
+                        if log:
+                            log(f"[中止] {_low}")
+                        disk_stopped_at = i - 1
+                        errors.append(f"磁盘空间不足，批次在第 {i - 1}/{total} 条中止，"
+                                      f"剩余 {total - i + 1} 条仍在队列中")
+                        break
                 row = dict(row)      # sqlite3.Row → dict：后续统一用 .get()，
                                      # 否则 Row 没有 .get() 会 AttributeError
                 vid = row["id"]
@@ -884,6 +942,10 @@ class HighlightCutter:
                 "rehighlight": bool(rehighlight),
                 "version": self.hl_version,
                 "disposed": disposed,
+                # disk_stopped_at>0 表示因空间不足提前收尾：**剩下的仍在队列里**
+                # （干净状态），下一次跑会接着处理，不需要任何补救动作。
+                "disk_stopped_at": disk_stopped_at,
+                "remaining": max(0, total - done - empty - failed),
                 "dir": str(hdir), "manifest": str(manifest), "errors": errors}
 
     def _dispose_one(self, db, row: Dict[str, Any], r: Dict[str, Any],

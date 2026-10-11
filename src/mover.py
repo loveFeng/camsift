@@ -81,6 +81,19 @@ STATE_LABELS: Dict[str, str] = {
 # 归属于回收目录顶层的全部子档名（搬迁/统计用）。顺序 = 展示顺序。
 ALL_SUBDIRS: Tuple[str, ...] = (CLIPPED_SUBDIR, PENDING_SUBDIR)
 
+# ---------------------------------------------------------------- 待保全的成因
+# `待保全` 只是一堆"精华还没落袋"的行，**下一步怎么做**却有三种，且互斥：
+#   error   —— 剪到一半炸了（磁盘满/中断）。时间戳与版本都已写入，两条队列都
+#              进不去 ⇒ 光"清 error"无效，必须 reset_highlight("failed_retry")。
+#   never   —— 从没排上队（首次剪辑还没开跑 / 队列被磁盘闸门拦住）。
+#              ⇒ 只要磁盘有空间，「启动画面精华剪辑」就会收走。
+#   version —— 剪过但版本落后且命中重剪症状 ⇒ 要跑「按新口径重剪」。
+# UI 的引导文案按这三桶分别给，不再写一句"先跑剪辑 + 重剪"的万能话。
+PEND_ERROR = "error"
+PEND_NEVER = "never"
+PEND_VERSION = "version"
+PENDING_REASONS: Tuple[str, ...] = (PEND_NEVER, PEND_VERSION, PEND_ERROR)
+
 
 def release_params(cfg: Dict) -> tuple[float, bool]:
     """放行门槛 + 「必须无人物信号」开关 —— 一键执行与审核台共用，避免两处口径漂移。
@@ -545,11 +558,19 @@ def recycle_stats(db, cfg: Optional[Dict] = None, verify: bool = False,
       in_trash  {状态: 回收目录内（trash_path 非空）该状态的条数}
       to_align  {状态: 其中没待在正确子档的条数}（= 下次对齐要搬的量）
       total     回收目录内的原片总数
+      pending_reasons {成因: 待保全里各类成因的条数}（见下）
 
     三个数的关系就是"打开回收目录该看到什么"：
         已剪辑  → 验完产物即可删
         待保全  → ★ 别删，精华还没落袋
         无精华产物 → 可直接删
+
+    ⚠️ `pending_reasons` 是 UI 唯一的引导依据，缺了它提示语只能写成一刀切的
+    "没剪完，先去跑剪辑" —— 而实测（2026-10-10）待保全里绝大多数是 `never`
+    （排队中，从没剪过）和 `error`（磁盘满半成品），两者的下一步完全不同：
+    前者只要开跑，后者光清 error 无效、必须 `reset_highlight("failed_retry")`。
+    三个桶与 `is_pending` 的三条返回路径一一对应，不多不少（`recycle_state`
+    判成 pending ⇒ `is_pending` 必真，而它的出口只有这三个）。
 
     verify 默认 False（只按库里记录，不碰文件系统）—— UI 每次 rerun 都会调它，
     详见 has_ab_clip 的说明。
@@ -558,6 +579,7 @@ def recycle_stats(db, cfg: Optional[Dict] = None, verify: bool = False,
     st: Dict[str, Any] = {
         "in_trash": {k: 0 for k in SUBDIR_BY_STATE},
         "to_align": {k: 0 for k in SUBDIR_BY_STATE},
+        "pending_reasons": {k: 0 for k in PENDING_REASONS},
         "total": 0,
     }
     for row in db.recycle_scan_rows(limit=limit):
@@ -566,7 +588,26 @@ def recycle_stats(db, cfg: Optional[Dict] = None, verify: bool = False,
         st["total"] += 1
         if current_subdir(row["trash_path"] or "", trash_root) != SUBDIR_BY_STATE[state]:
             st["to_align"][state] += 1
+        if state == STATE_PENDING:
+            st["pending_reasons"][pending_reason(row)] += 1
     return st
+
+
+def pending_reason(row) -> str:
+    """`待保全` 的成因（UI 引导用；判据与 `is_pending` 的分支严格同序）。
+
+    ⚠️ 这里的顺序不能改：必须**先判 error**，否则磁盘满那批（error 非空、
+    highlight_at 已写）会被误归成 `never`，UI 就会把人引到"启动剪辑"这个
+    空动作上 —— 而它们两条队列都进不去，点了也剪不到。
+    """
+    try:
+        if row["highlight_error"]:
+            return PEND_ERROR
+        if row["highlight_at"] is None:
+            return PEND_NEVER
+    except (KeyError, IndexError, TypeError):
+        pass
+    return PEND_VERSION
 
 
 def align_subdirs(db, cfg: Dict, log: Optional[Callable[[str], None]] = None,

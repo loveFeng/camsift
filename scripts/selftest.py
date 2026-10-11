@@ -2093,6 +2093,125 @@ def test_rehighlight_idempotent():
           "any_running 纳入重剪任务（它与剪辑抢同一批源文件，不能并发）")
 
 
+def test_failed_retry_recovers_halfdone():
+    """磁盘满留下的半成品行必须能被捞回来 —— 单靠 reset_highlight("failed") 不行。
+
+    实测事故（2026-10-08）：磁盘满发生在 mark_highlight() 之后、写manifest 之前，
+    留下 `highlight_at` 非空 + `version` 已是目标值 + `clips=[]` + `error 非空`
+    的行。此时两条队列的门同时关上：
+      - highlight_queue 要求 `highlight_at IS NULL`
+      - rehighlight_queue 要求 `version <> target`
+    而 `reset_highlight("failed")` 只清 error ⇒ 清完队列仍为 0（真事故 530 条）。
+    """
+    section("失败重试：零产物半成品行能退回队列（磁盘满事故）")
+    from src.highlighter import HL_VERSION
+
+    d, db, bid, ids = _tmp_db(5)
+    try:
+        for vid in ids:
+            db.update_analysis(vid, {"status": "analyzed", "retention_score": 0,
+                                     "verdict": "trash", "decision_trace": {}})
+        # ①②③ 模拟磁盘满的半成品：写库已提交（at 与 version 都到位），
+        #      但 clips 为空、随后被标了 Errno 28。
+        # ④ 一条"有产物"的失败行：不该被重试逻辑拖回队列。
+        # ⑤ 一条 keep 行 + 零产物 + 有 error：人工已表态，程序不该动。
+        for i in (0, 1, 3):
+            db.mark_highlight(ids[i], "t", 0, 0.0, [], sent=80, coarse_hits=4,
+                              version=HL_VERSION)
+            db.mark_highlight_error(ids[i], "OSError: [Errno 28] No space left on device")
+        db.mark_highlight(ids[2], "t", 2, 15.0,
+                          [{"grade": "B", "file": "b.mp4"}],
+                          sent=50, coarse_hits=3, version=HL_VERSION)
+        db.mark_highlight_error(ids[2], "boom")
+        db.set_human_decision(ids[4], "keep")
+
+        check(len(db.highlight_queue(limit=99)) == 0,
+              "事故态：半成品行进不了正常剪辑队列（highlight_at 已写入）")
+        check(len(db.rehighlight_queue(limit=99, target_version=HL_VERSION,
+                                       only_dropped=True)) == 0,
+              "事故态：也进不了重剪队列（version 已是目标值）")
+        check(db.count_failed_retryable() == 3,
+              f"零产物失败行被识别为可重试（{db.count_failed_retryable()} 条，应为 3）")
+
+        n = db.reset_highlight("failed_retry")
+        check(n == 3, f"failed_retry 退回全部零产物失败行（{n} 条，应为 3）")
+        q = [r["id"] for r in db.highlight_queue(limit=99)]
+        check(ids[0] in q and ids[1] in q,
+              "零产物的失败行已回到正常剪辑队列（可以重剪了）")
+        check(ids[2] not in q,
+              "有产物的失败行不被拖回队列（产物还在，别浪费机时）")
+        check(ids[4] not in q,
+              "keep 行不动（人工已表态，程序不碰它的产物状态）")
+        check(db.reset_highlight("failed_retry") == 0,
+              "幂等：清完再跑一次影响 0 行（不会自我循环）")
+
+        # all 会误伤，必须能说清为什么不能用它
+        check(db.reset_highlight("all") == 5,
+              "all 是无条件的（5 条全中）—— 这就是它不能用来救这批的原因")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ⚠️ 操作陷阱（真实存在，UI 已规避）：先点了失效的 failed 再点 failed_retry，
+    #    failed_retry 会**一行都救不回来** —— error 已被清空，它的判据就失效了。
+    #    顺序必须是 failed_retry 在前（或干脆只用 failed_retry）。
+    d2, db2, _bid2, ids2 = _tmp_db(3)
+    try:
+        for vid in ids2:
+            db2.update_analysis(vid, {"status": "analyzed", "retention_score": 0,
+                                      "verdict": "trash", "decision_trace": {}})
+            db2.mark_highlight(vid, "t", 0, 0.0, [], sent=80, coarse_hits=4,
+                               version=HL_VERSION)
+            db2.mark_highlight_error(vid, "OSError: [Errno 28] No space left on device")
+        db2.reset_highlight("failed")
+        check(db2.count_failed_retryable() == 0,
+              "陷阱确认：failed 先跑会把 error 清空，之后 failed_retry 数不出行")
+        check(len(db2.highlight_queue(limit=99)) == 0,
+              "陷阱后果：这两步按顺序点完，这批行依然剪不到（所以 UI 只给一个入口）")
+        uisrc = Path("src/ui.py").read_text(encoding="utf-8")
+        check('reset_highlight("failed")' not in uisrc,
+              "UI 不再暴露那个会把自己变成死路的 failed 入口")
+    finally:
+        shutil.rmtree(d2, ignore_errors=True)
+
+
+
+def test_highlight_disk_guard():
+    """剪辑必须有磁盘硬闸门 —— 空间不足时别开跑。
+
+    理由不是"跑不满会报错"，而是跑一半炸盘会留下捞不回来的半成品行
+    （见test_failed_retry_recovers_halfdone）。留在队列里是干净状态，
+    留下半成品行则两条队列都收不到。
+    """
+    section("剪辑前磁盘空间预检")
+    from src import highlighter as hl
+
+    check(hasattr(hl, "MIN_FREE_GIB") and hl.MIN_FREE_GIB > 0,
+          f"定义了安全阈值（{getattr(hl, 'MIN_FREE_GIB', 0)} GiB）")
+    check(callable(getattr(hl, "disk_block_reason", None)),
+          "disk_block_reason 存在（不够则返回阻止理由，够则 None）")
+    src = Path("src/highlighter.py").read_text(encoding="utf-8")
+    # 批次开始前拦一次
+    check(src.count("disk_block_reason(self.cfg)") >= 1,
+          "run_batch 在批次开始前调用预检（空间不足直接 raise）")
+    # 批次中途复查：开跑时有空间 ≠ 跑到第800 条时还有
+    check("% 20 == 1" in src or "i % 20" in src,
+          "批次中途复查剩余空间（不能只在开跑时看一眼）")
+    check("disk_stopped_at" in src,
+          "因空间不足中止时把剩余条数带进返回值（剩下的留在队列里）")
+    # 取不到空间时不能拦 —— 预检失败不该把整批挡死
+    check("return None" in src.split("def free_gib")[1].split("def ")[0],
+          "free_gib 取不到时返回 None，不因此拦任务")
+
+    uisrc = Path("src/ui.py").read_text(encoding="utf-8")
+    check("disk_block_reason" in uisrc,
+          "UI 在启动按钮前就显示空间不足（否则用户只看到'启动失败'）")
+    check("reset_highlight(\"failed_retry\")" in uisrc,
+          "UI 挂的是 failed_retry 入口（不是那个点了没用的 failed）")
+    dbsrc = Path("src/db.py").read_text(encoding="utf-8")
+    check("def count_failed_retryable" in dbsrc,
+          "db 暴露可重试条数（按钮上要写清会捞回几条）")
+
+
 def test_recycle_subdirs():
     """回收子档三态：已剪辑 / 待保全 / 无精华产物。
 
@@ -2254,6 +2373,28 @@ def test_recycle_subdirs():
         check(sum(st["to_align"].values()) == 0,
               f"全部就位后 to_align 归零（{st['to_align']}）")
 
+        # ⑧b pending_reasons：待保全的**成因**必须分桶报，且与 is_pending 的
+        # 三条出口一一对应。UI 靠它决定引导语 —— 对 error 那批说"去跑剪辑"
+        # 是空动作（两条队列都不收它们），这个桶就是为了不写那种话。
+        pr = st["pending_reasons"]
+        check(sum(pr.values()) == st["in_trash"][M.STATE_PENDING],
+              f"pending_reasons 三桶之和 == 待保全总数（{pr} vs "
+              f"{st['in_trash'][M.STATE_PENDING]}）")
+        check(pr.get(M.PEND_NEVER) == 1 and pr.get(M.PEND_ERROR) == 1
+              and pr.get(M.PEND_VERSION) == 0,
+              f"pending_reasons 分桶正确（从没剪过=1 / 硬失败=1 / 版本落后=0）：{pr}")
+        # 反漂移：每一条被判 pending 的行都必须能归出一个桶，且互斥
+        _bad = [r["id"] for r in db.recycle_scan_rows()
+                if M.recycle_state(r, verify=True) == M.STATE_PENDING
+                and M.pending_reason(r) not in M.PENDING_REASONS]
+        check(not _bad, f"pending_reason 的取值都在 PENDING_REASONS 内（异常 id：{_bad}）")
+        # 磁盘满那批的形状（at 非空 + version 已到目标 + error 非空）必须归 error，
+        # 绝不能被归成 never —— 那个形状正是 2026-10-08 卡死 530 条的形状。
+        _shape = {"highlight_at": "2026-10-08 10:00:00", "highlight_error": "OSError",
+                  "highlight_version": DBmod.HIGHLIGHT_TARGET_VERSION}
+        check(M.pending_reason(_shape) == M.PEND_ERROR,
+              "磁盘满半成品的行形状（at 非空 + 版本已到目标 + error 非空）→ 归 error")
+
         # ⑨ 撤销必须依然可用 —— 子档只是换了个子目录，不该破坏回退
         rr = db.get_video(ids[4])
         ok7, _ = M.undo_move(db, rr)
@@ -2283,6 +2424,20 @@ def test_recycle_subdirs():
     check("re_hl_only_first" not in ui_src,
           "UI：不给「全量重剪」勾选框 —— UI 只收症状行；"
           "要全量走 jobs.start_rehighlight(only_dropped=False)")
+    # 「零产物失败退回」必须在**回收目录三堆**卡片里（不是剪辑段）：
+    # 它的目的是让「待保全」归零，属回收目录的补救动作；挂在剪辑段里，
+    # 机主从"为什么待保全不清零"查起要翻过整段参数才找得到，方向是反的。
+    _i_recycle = ui_src.find("回收目录三堆")
+    _i_retry = ui_src.find("零产物失败记录（可重剪）")
+    check(_i_recycle != -1 and _i_retry > _i_recycle,
+          "UI：「↩ 退回 N 条零产物失败记录」在「回收目录三堆」卡片内"
+          f"（卡片@{_i_recycle} 按钮@{_i_retry}）")
+    check(ui_src.count('key="reset_highlight_failed_retry"') == 1,
+          "UI：零产物失败退回按钮只有一处（挂两处 = 两个入口 = 迟早只点一个）")
+    check("pending_reasons" in ui_src,
+          "UI：待保全提示按 pending_reasons 分桶给引导，不写一刀切文案")
+    check("先跑完「画面精华剪辑」+「按新口径重剪」" not in ui_src,
+          "UI：旧的一刀切提示语已删除（它对磁盘满那批是空动作）")
     ah = Path("scripts/audit_highlight.py").read_text(encoding="utf-8")
     check("HIGHLIGHT_TARGET_VERSION" in ah and "recycle_state" in ah,
           "产物体检脚本复用 db 的目标版本与 mover 的三态判据（不另立口径）")
@@ -2871,6 +3026,8 @@ def main() -> int:
     test_spotcheck_rejudge()
     test_no_clip_split()
     test_rehighlight_idempotent()
+    test_failed_retry_recovers_halfdone()
+    test_highlight_disk_guard()
     test_recycle_subdirs()
     test_audit_highlight_states()
     test_highlight_batch()

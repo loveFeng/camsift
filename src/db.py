@@ -1230,18 +1230,59 @@ class Database:
     def reset_highlight(self, scope: str = "failed") -> int:
         """清除精华剪辑标记，用于改参数后重跑。
 
-        failed = 仅清失败标记（源缺失等硬错误）
-        all    = 全部重来（已切出的片段文件不会被删除，新产物会加序号后缀）
+        failed       仅清失败标记（源缺失等硬错误）
+        failed_retry 失败**且零产物**的行彻底退回未处理（能被 highlight_queue 收走）
+        all          全部重来（已切出的片段文件不会被删除，新产物会加序号后缀）
+
+        ⚠️ `failed` 单用常常**没用**：磁盘满这类失败发生在 `mark_highlight()`
+        之后、写manifest 之前，于是那批行留下 `highlight_at` 非空 +
+        `highlight_version` 已是目标值的半成品状态 —— 两条队列同时把它们挡在
+        外头（`highlight_queue` 要 `highlight_at IS NULL`，`rehighlight_queue`
+        要 `version <> target`），清掉 error 也依然进不去。
+        实测 2026-10-08：530 条 `No space left on device` 就是这个形状，
+        `failed` 清完队列仍为 0。这类要用 `failed_retry`。
+
+        `failed_retry` 的判据是 `highlight_count=0`，与 `rehighlight_queue` 的
+        `dropped` 口径一致（不是"文件是否还存在"）。这样已经剪出 A/B 的行
+        天然不命中 —— 它们 `highlight_count>0`，不会被拖回队列重跑；也天然
+        幂等：重跑后仍零产物的下次还会被选中。`human_decision='keep'` 的行
+        同样不命中 —— 人工已表态，程序不碰它的产物状态。
         """
         with self.conn() as c:
             if scope == "failed":
                 cur = c.execute(
                     "UPDATE videos SET highlight_error=NULL WHERE highlight_error IS NOT NULL")
+            elif scope == "failed_retry":
+                # 只捞"零产物的失败行"：error 非空 且 没有剪出过任何片段。
+                # 四个 highlight_* 字段一起清 —— 留着 highlight_at 会让队列
+                # 认为它已处理过（见上面 docstring 的半成品状态）。
+                # `human_decision IS NOT 'keep'` 与 count_failed_retryable 及
+                # pending_highlight_ids 同口径：keep 是人工已表态的行，程序不该
+                # 动它的产物状态（mover.K1 同一条纪律）。
+                cur = c.execute(
+                    "UPDATE videos SET highlight_at=NULL, highlight_count=NULL, "
+                    "highlight_sec=NULL, highlight_clips=NULL, highlight_error=NULL, "
+                    "highlight_best_grade=NULL, ab_clips_count=NULL "
+                    "WHERE highlight_error IS NOT NULL "
+                    "AND COALESCE(highlight_count,0)=0 "
+                    "AND human_decision IS NOT 'keep'")
             else:
                 cur = c.execute(
                     "UPDATE videos SET highlight_at=NULL, highlight_count=NULL, "
                     "highlight_sec=NULL, highlight_clips=NULL, highlight_error=NULL")
             return cur.rowcount
+
+    def count_failed_retryable(self) -> int:
+        """`reset_highlight("failed_retry")` 会影响多少行 —— UI 按钮上要写清楚。
+
+        单独一个count 而不是拿 reset 的返回值：按钮渲染在写入之前，
+        得先知道"点了会捞回几条"才值得让用户点。
+        """
+        with self.conn() as c:
+            return c.execute(
+                "SELECT COUNT(*) FROM videos WHERE highlight_error IS NOT NULL "
+                "AND COALESCE(highlight_count,0)=0 "
+                "AND human_decision IS NOT 'keep'").fetchone()[0]
 
     def list_highlight_rows(self, limit: int = 5000) -> List[sqlite3.Row]:
         """已出精华结果的记录（含 clips JSON），复核页用。"""
